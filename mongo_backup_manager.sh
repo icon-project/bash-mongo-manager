@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Get the current directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -6,15 +7,21 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 # Define log file
 LOG_FILE="${SCRIPT_DIR}/logs/mongo_backup_manager.log"
 
+# Ensure logs dir exists
+mkdir -p "$(dirname "$LOG_FILE")"
+
 # Add a separator for each run
-echo "===================================" >> "$LOG_FILE"
-echo "Backup started at $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
-echo "===================================" >> "$LOG_FILE"
+{
+  echo "==================================="
+  echo "Run started at $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "==================================="
+} >> "$LOG_FILE"
 
 # Load environment variables from .env file
 ENV_FILE="${SCRIPT_DIR}/.env"
 if [ -f "$ENV_FILE" ]; then
   set -a
+  # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +a
 else
@@ -45,7 +52,7 @@ health_check() {
 
   # Check if each variable is set
   for var in "${REQUIRED_VARS[@]}"; do
-    if [ -z "${!var}" ]; then
+    if [ -z "${!var:-}" ]; then
       echo "Error: $var is not set in the .env file."
       exit 1
     fi
@@ -61,53 +68,51 @@ S3_BACKUP_DIR_TEMP="./backups_temp"
 BACKUP_FILE_NAME="mongo_backup_${TIMESTAMP}.gz"
 BACKUP_FILE="${BACKUP_DIR}/${BACKUP_FILE_NAME}"
 if [ "$USE_REMOTE" != "false" ]; then
-  S3_BACKUP_PATH=s3://${S3_BUCKET_NAME}/mongodb-backups/
+  S3_BACKUP_PATH="s3://${S3_BUCKET_NAME}/mongodb-backups/"
 fi
 
+# Helper: build mongo auth args as an array (prevents shell-quoting issues)
+build_mongo_auth_args() {
+  local -n _out=$1
+  _out=()
+  if [ "$USE_CREDENTIALS" != "false" ]; then
+    _out+=( "--username=$MONGO_USER" "--password=$MONGO_PASSWORD" "--authenticationDatabase=admin" )
+  fi
+}
 
 # Function to perform backup
 backup() {
   echo "Starting MongoDB backup at $TIMESTAMP..."
 
-  # Ensure the backup directory exists, handle errors gracefully
-  if ! mkdir -p $BACKUP_DIR; then
-    echo "Warning: Could not create or access backup directory $BACKUP_DIR. Proceeding..."
-  fi
+  mkdir -p "$BACKUP_DIR"
 
-  # Run the MongoDB dump command inside the container
-  MONGO_AUTH_ARGS=""
-  if [ "$USE_CREDENTIALS" != "false" ]; then
-    MONGO_AUTH_ARGS="--username=$MONGO_USER --password=$MONGO_PASSWORD --authenticationDatabase admin"
-  fi
-  docker exec "$CONTAINER_NAME" sh -c "mongodump --archive=$BACKUP_FILE_NAME --gzip $MONGO_AUTH_ARGS --db=$MONGO_DB_NAME"
+  # Build auth args safely
+  local AUTH_ARGS=()
+  build_mongo_auth_args AUTH_ARGS
 
-  if [ $? -eq 0 ]; then
-    echo "MongoDB dump completed successfully."
-  else
-    echo "Error: Failed to dump MongoDB data."
-    exit 1
-  fi
+  # Run the MongoDB dump command inside the container (NO sh -c; pass args directly)
+  docker exec "$CONTAINER_NAME" mongodump \
+    --archive="$BACKUP_FILE_NAME" \
+    --gzip \
+    "${AUTH_ARGS[@]}" \
+    --db="$MONGO_DB_NAME"
+
+  echo "MongoDB dump completed successfully."
 
   # Copy the backup from the container to the host
-  docker cp $CONTAINER_NAME:$BACKUP_FILE_NAME $BACKUP_FILE
+  docker cp "$CONTAINER_NAME:$BACKUP_FILE_NAME" "$BACKUP_FILE"
 
   # Upload the backup to S3
   if [ "$USE_REMOTE" != "false" ]; then
-    aws s3 cp $BACKUP_FILE $S3_BACKUP_PATH --profile $AWS_PROFILE
-
-    if [ $? -eq 0 ]; then
-      echo "Backup uploaded to S3 successfully."
-    else
-      echo "Error: Failed to upload backup to S3."
-      exit 1
-    fi
+    aws s3 cp "$BACKUP_FILE" "$S3_BACKUP_PATH" --profile "$AWS_PROFILE"
+    echo "Backup uploaded to S3 successfully."
   else
     echo "Skipping S3 upload because USE_REMOTE=false."
   fi
 
-  # Cleanup old backups (optional: keep last 7 days)
-  # find $BACKUP_DIR -type f -mtime +7 -name "*.gz" -exec rm {} \;
-  find $BACKUP_DIR -type f -mtime +7 -name "*.gz" -exec echo "Deleting old backup file: " {} \; -exec rm {} \;
+  # Cleanup old backups (keep last 7 days)
+  find "$BACKUP_DIR" -type f -mtime +7 -name "*.gz" \
+    -exec echo "Deleting old backup file: " {} \; -exec rm {} \;
 
   echo "Backup completed successfully at $TIMESTAMP and saved to $BACKUP_FILE."
 }
@@ -119,13 +124,13 @@ list_backups_s3() {
     echo "Skipping S3 listing because USE_REMOTE=false."
     return 0
   fi
-  aws s3 ls $S3_BACKUP_PATH --recursive --profile $AWS_PROFILE
+  aws s3 ls "$S3_BACKUP_PATH" --recursive --profile "$AWS_PROFILE"
 }
 
 # Function to list backups in the local directory
 list_backups_local() {
   echo "Listing MongoDB backups in $BACKUP_DIR..."
-  ls -lh $BACKUP_DIR
+  ls -lh "$BACKUP_DIR"
 }
 
 # Function to restore a given backup
@@ -133,16 +138,16 @@ list_backups_local() {
 # When all four namespace args are provided, restores that collection from the archive
 # (source_db.source_collection) into the destination namespace (dest_db.dest_collection).
 restore() {
-  if [ -z "$1" ]; then
+  if [ -z "${1:-}" ]; then
     echo "Error: Please provide the backup file to restore."
     exit 1
   fi
 
-  RESTORE_FILE=$1
-  RESTORE_SOURCE_DB=$2
-  RESTORE_SOURCE_COLLECTION=$3
-  RESTORE_DEST_DB=$4
-  RESTORE_DEST_COLLECTION=$5
+  local RESTORE_FILE=$1
+  local RESTORE_SOURCE_DB=${2:-}
+  local RESTORE_SOURCE_COLLECTION=${3:-}
+  local RESTORE_DEST_DB=${4:-}
+  local RESTORE_DEST_COLLECTION=${5:-}
 
   if [ ! -e "$RESTORE_FILE" ]; then
     echo "Error: Backup file $RESTORE_FILE not found in the host."
@@ -158,60 +163,56 @@ restore() {
   fi
 
   echo "Copying MongoDB backup file to the container..."
-
-  # Copy the backup file to the container
-  docker cp "$RESTORE_FILE" "$CONTAINER_NAME:/tmp/$(basename $RESTORE_FILE)"
-
-  if [ $? -ne 0 ]; then
-    echo "Error: Failed to copy backup file to the container."
-    exit 1
-  fi
-
+  docker cp "$RESTORE_FILE" "$CONTAINER_NAME:/tmp/$(basename "$RESTORE_FILE")"
   echo "Restoring MongoDB backup from $RESTORE_FILE..."
 
-  # Run the MongoDB restore command inside the container
+  # Build args safely (NO sh -c)
+  local AUTH_ARGS=()
+  build_mongo_auth_args AUTH_ARGS
 
-  MONGO_AUTH_ARGS=""
-  if [ "$USE_CREDENTIALS" != "false" ]; then
-    MONGO_AUTH_ARGS="--username=$MONGO_USER --password=$MONGO_PASSWORD --authenticationDatabase admin"
-  fi
+  local RESTORE_ARGS=(
+    "--archive=/tmp/$(basename "$RESTORE_FILE")"
+    "--gzip"
+    "--drop"
+  )
 
-  NS_REMAP_ARGS=""
-  RESTORE_DB_ARG="--db=$MONGO_DB_NAME"
-  if [ -n "$RESTORE_SOURCE_DB" ] && [ -n "$RESTORE_SOURCE_COLLECTION" ] && [ -n "$RESTORE_DEST_DB" ] && [ -n "$RESTORE_DEST_COLLECTION" ]; then
-    NS_REMAP_ARGS="--nsFrom=\"${RESTORE_SOURCE_DB}.${RESTORE_SOURCE_COLLECTION}\" --nsTo=\"${RESTORE_DEST_DB}.${RESTORE_DEST_COLLECTION}\""
-    RESTORE_DB_ARG="--db=$RESTORE_SOURCE_DB"
-    echo "Remapping namespace: ${RESTORE_SOURCE_DB}.${RESTORE_SOURCE_COLLECTION} -> ${RESTORE_DEST_DB}.${RESTORE_DEST_COLLECTION}"
+  # If remapping, use nsInclude/nsFrom/nsTo (avoids deprecated --db/--collection behavior)
+  if [ -n "$RESTORE_SOURCE_DB" ]; then
+    local SRC_NS="${RESTORE_SOURCE_DB}.${RESTORE_SOURCE_COLLECTION}"
+    local DST_NS="${RESTORE_DEST_DB}.${RESTORE_DEST_COLLECTION}"
+    echo "Remapping namespace: $SRC_NS -> $DST_NS"
     echo "Note: MongoDB user must have readWrite on destination database '${RESTORE_DEST_DB}'."
-  fi
 
-  docker exec "$CONTAINER_NAME" sh -c "mongorestore --archive=/tmp/$(basename $RESTORE_FILE) --gzip --drop $MONGO_AUTH_ARGS $RESTORE_DB_ARG $NS_REMAP_ARGS"
-
-  if [ $? -eq 0 ]; then
-    echo "MongoDB restore completed successfully."
+    RESTORE_ARGS+=(
+      "--nsInclude=$SRC_NS"
+      "--nsFrom=$SRC_NS"
+      "--nsTo=$DST_NS"
+    )
   else
-    echo "Error: Failed to restore MongoDB data."
-    exit 1
+    # Default behavior: restore only the configured DB
+    RESTORE_ARGS+=("--nsInclude=${MONGO_DB_NAME}.*")
   fi
+
+  docker exec "$CONTAINER_NAME" mongorestore \
+    "${AUTH_ARGS[@]}" \
+    "${RESTORE_ARGS[@]}"
+
+  echo "MongoDB restore completed successfully."
 
   echo "Cleaning up temporary backup file in the container..."
-  docker exec "$CONTAINER_NAME" sh -c "rm /tmp/$(basename $RESTORE_FILE)"
-
-  if [ $? -ne 0 ]; then
-    echo "Warning: Failed to clean up temporary backup file in the container."
-  fi
+  docker exec "$CONTAINER_NAME" rm -f "/tmp/$(basename "$RESTORE_FILE")" || true
 
   echo "Restore completed successfully."
 }
 
 # Function to download a backup from S3 and put it in the S3_BACKUP_DIR_TEMP
 download_backup() {
-  if [ -z "$1" ]; then
+  if [ -z "${1:-}" ]; then
     echo "Error: Please provide the backup file to download."
     exit 1
   fi
 
-  DOWNLOAD_FILE=$1
+  local DOWNLOAD_FILE=$1
 
   if [ "$USE_REMOTE" == "false" ]; then
     echo "Skipping S3 download because USE_REMOTE=false."
@@ -219,26 +220,13 @@ download_backup() {
   fi
 
   # Check if the backup file exists in S3
-  aws s3 ls $S3_BACKUP_PATH$DOWNLOAD_FILE --profile $AWS_PROFILE > /dev/null
-  if [ $? -ne 0 ]; then
-    echo "Error: Backup file $DOWNLOAD_FILE not found in S3."
-    exit 1
-  fi
+  aws s3 ls "${S3_BACKUP_PATH}${DOWNLOAD_FILE}" --profile "$AWS_PROFILE" > /dev/null
 
   # Ensure the temporary backup directory exists
-  if [ ! -d "$S3_BACKUP_DIR_TEMP" ]; then
-    mkdir -p "$S3_BACKUP_DIR_TEMP"
-  fi
+  mkdir -p "$S3_BACKUP_DIR_TEMP"
 
   echo "Downloading MongoDB backup from S3..."
-  aws s3 cp $S3_BACKUP_PATH$DOWNLOAD_FILE $S3_BACKUP_DIR_TEMP --profile $AWS_PROFILE
-
-  if [ $? -eq 0 ]; then
-    echo "Backup downloaded from S3 successfully."
-  else
-    echo "Error: Failed to download backup from S3."
-    exit 1
-  fi
+  aws s3 cp "${S3_BACKUP_PATH}${DOWNLOAD_FILE}" "$S3_BACKUP_DIR_TEMP" --profile "$AWS_PROFILE"
 
   echo "Download completed successfully."
 }
@@ -258,72 +246,55 @@ help() {
   echo "  download_backup [file] Download a backup from S3 and store it locally."
   echo "  help                   Display this help message."
   echo
-  echo "Options:"
-  echo "  -h, --help          Display this help message."
-  echo "  [file]              The name of the backup file (e.g., mongo_backup_2024-11-20.gz)."
-  echo
   echo "Environment Flags:"
   echo "  USE_CREDENTIALS=false  Skip MongoDB username/password when dumping/restoring."
   echo "  USE_REMOTE=false       Skip all S3 uploads/downloads/list operations."
   echo
   echo "Examples:"
   echo "  ./mongo_backup_manager.sh backup"
-  echo "    Performs a backup and uploads it to S3."
-  echo
-  echo "  ./mongo_backup_manager.sh restore mongo_backup_2024-11-20.gz"
-  echo "    Restores the backup 'mongo_backup_2024-11-20.gz' from the local directory or S3."
-  echo
-  echo "  ./mongo_backup_manager.sh restore mongo_backup_2024-11-20.gz new-world users my-app stateful_users"
-  echo "    Restores and remaps new-world.users from the archive to my-app.stateful_users on the destination."
-  echo
-  echo "  ./mongo_backup_manager.sh list_backups_s3"
-  echo "    Lists all backups available in the S3 bucket."
-  echo
-  echo "  ./mongo_backup_manager.sh download mongo_backup_2024-11-20.gz"
-  echo "    Downloads the backup 'mongo_backup_2024-11-20.gz' from S3 to the local directory."
-  echo
-  echo "Note:"
-  echo "  Ensure the .env file is present in the same directory for environment variable configuration."
-  echo "  You can configure the backup directory, S3 bucket name, and MongoDB connection details in the .env file."
+  echo "  ./mongo_backup_manager.sh restore ./backups/mongo_backup_2026-02-09_08-56-18.gz"
+  echo "  ./mongo_backup_manager.sh restore ./backups/mongo_backup_2026-02-09_08-56-18.gz sodax-registration users new-world stateful_users"
 }
 
 # Call the help function if the script is run without arguments or with the 'help' command
-if [ $# -eq 0 ] || [[ "$1" == "help" ]] || [[ "$1" == "-h" ]]; then
+if [ $# -eq 0 ] || [[ "${1:-}" == "help" ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
   help
   exit 0
 fi
 
 # Main logic to parse arguments and call the corresponding function
-if [ "$1" == "backup" ]; then
-  # Call the backup function
-  health_check
-  backup
-elif [ "$1" == "list_backups_s3" ]; then
-  # Call the list_backups_s3 function
-  health_check
-  list_backups_s3
-elif [ "$1" == "list_backups_local" ]; then
-  # Call the list_backups_local function
-  health_check
-  list_backups_local
-elif [ "$1" == "restore" ]; then
-  # Call the restore function (file, optional source_db source_collection dest_db dest_collection)
-  health_check
-  restore "$2" "$3" "$4" "$5" "$6"
-elif [ "$1" == "download_backup" ]; then
-  # Call the download_backup function
-  health_check
-  download_backup "$2"
-elif [ "$1" == "help" ]; then
-  # Call the help function
-  help
-else
-  # If the command is invalid, print usage
-  echo "Usage: $0 {backup|restore|download} [file]"
-  exit 1
-fi
+case "$1" in
+  backup)
+    health_check
+    backup
+    ;;
+  list_backups_s3)
+    health_check
+    list_backups_s3
+    ;;
+  list_backups_local)
+    health_check
+    list_backups_local
+    ;;
+  restore)
+    health_check
+    restore "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
+    ;;
+  download_backup)
+    health_check
+    download_backup "${2:-}"
+    ;;
+  help|-h|--help)
+    help
+    ;;
+  *)
+    echo "Usage: $0 {backup|restore|list_backups_s3|list_backups_local|download_backup|help} [args]"
+    exit 1
+    ;;
+esac
 
-# At the end of the script
-echo "-----------------------------------" >> "$LOG_FILE"
-echo "Backup ended at $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
-echo "-----------------------------------" >> "$LOG_FILE"
+{
+  echo "-----------------------------------"
+  echo "Run ended at $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "-----------------------------------"
+} >> "$LOG_FILE"
