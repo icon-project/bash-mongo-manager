@@ -129,6 +129,9 @@ list_backups_local() {
 }
 
 # Function to restore a given backup
+# Usage: restore <backup_file> [source_collection] [dest_collection]
+# When source_collection and dest_collection are both provided, restores the named
+# collection from the archive into the destination collection name in MONGO_DB_NAME.
 restore() {
   if [ -z "$1" ]; then
     echo "Error: Please provide the backup file to restore."
@@ -136,9 +139,20 @@ restore() {
   fi
 
   RESTORE_FILE=$1
+  RESTORE_COLLECTION_SOURCE=$2
+  RESTORE_COLLECTION_DEST=$3
 
   if [ ! -e "$RESTORE_FILE" ]; then
     echo "Error: Backup file $RESTORE_FILE not found in the host."
+    exit 1
+  fi
+
+  if [ -n "$RESTORE_COLLECTION_DEST" ] && [ -z "$RESTORE_COLLECTION_SOURCE" ]; then
+    echo "Error: When specifying a destination collection, you must also specify the source collection name (as in the backup)."
+    exit 1
+  fi
+  if [ -n "$RESTORE_COLLECTION_SOURCE" ] && [ -z "$RESTORE_COLLECTION_DEST" ]; then
+    echo "Error: When specifying a source collection, you must also specify the destination collection name."
     exit 1
   fi
 
@@ -161,7 +175,13 @@ restore() {
     MONGO_AUTH_ARGS="--username=$MONGO_USER --password=$MONGO_PASSWORD --authenticationDatabase admin"
   fi
 
-  docker exec "$CONTAINER_NAME" sh -c "mongorestore --archive=/tmp/$(basename $RESTORE_FILE) --gzip --drop $MONGO_AUTH_ARGS --db=$MONGO_DB_NAME"
+  NS_REMAP_ARGS=""
+  if [ -n "$RESTORE_COLLECTION_SOURCE" ] && [ -n "$RESTORE_COLLECTION_DEST" ]; then
+    NS_REMAP_ARGS="--nsFrom=\"${MONGO_DB_NAME}.${RESTORE_COLLECTION_SOURCE}\" --nsTo=\"${MONGO_DB_NAME}.${RESTORE_COLLECTION_DEST}\""
+    echo "Remapping collection: ${MONGO_DB_NAME}.${RESTORE_COLLECTION_SOURCE} -> ${MONGO_DB_NAME}.${RESTORE_COLLECTION_DEST}"
+  fi
+
+  docker exec "$CONTAINER_NAME" sh -c "mongorestore --archive=/tmp/$(basename $RESTORE_FILE) --gzip --drop $MONGO_AUTH_ARGS --db=$MONGO_DB_NAME $NS_REMAP_ARGS"
 
   if [ $? -eq 0 ]; then
     echo "MongoDB restore completed successfully."
@@ -227,7 +247,8 @@ help() {
   echo
   echo "Commands:"
   echo "  backup                 Perform a MongoDB backup and upload it to S3."
-  echo "  restore [file]         Restore a MongoDB backup from a local file or S3."
+  echo "  restore [file] [source_collection] [dest_collection]"
+  echo "                         Restore a MongoDB backup. Optionally remap a collection to a new name."
   echo "  list_backups_s3        List all backups available in the S3 bucket."
   echo "  list_backups_local     List all backups in the local backup directory."
   echo "  download_backup [file] Download a backup from S3 and store it locally."
@@ -247,6 +268,9 @@ help() {
   echo
   echo "  ./mongo_backup_manager.sh restore mongo_backup_2024-11-20.gz"
   echo "    Restores the backup 'mongo_backup_2024-11-20.gz' from the local directory or S3."
+  echo
+  echo "  ./mongo_backup_manager.sh restore mongo_backup_2024-11-20.gz users users_restored"
+  echo "    Restores the backup and writes collection 'users' from the archive into collection 'users_restored' on the destination database."
   echo
   echo "  ./mongo_backup_manager.sh list_backups_s3"
   echo "    Lists all backups available in the S3 bucket."
@@ -279,9 +303,9 @@ elif [ "$1" == "list_backups_local" ]; then
   health_check
   list_backups_local
 elif [ "$1" == "restore" ]; then
-  # Call the restore function
+  # Call the restore function (file, optional source collection, optional dest collection)
   health_check
-  restore "$2"
+  restore "$2" "$3" "$4"
 elif [ "$1" == "download_backup" ]; then
   # Call the download_backup function
   health_check

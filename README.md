@@ -163,6 +163,16 @@ To restore a backup, you can use the `restore_backup` command by specifying the 
 The following command showcases how to restore a backup:
 ```bash
 ./mongo_backup_manager.sh restore backups_temp/mongo_backup_2024-11-20_13-28-59.gz
+```
+
+You can optionally restore a specific collection from the backup into a different collection name on the destination database by passing the source collection name (as in the backup) and the desired destination collection name:
+```bash
+./mongo_backup_manager.sh restore backups_temp/mongo_backup_2024-11-20_13-28-59.gz user_tasks user_tasks_imported
+```
+This restores the `user_tasks` collection from the archive into a collection named `user_tasks_imported` in the destination database (other collections in the backup are still restored with their original names).
+
+Example output:
+```
 Performing health check...
 Health check passed! All required variables are set.
 Copying MongoDB backup file to the container...
