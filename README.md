@@ -165,11 +165,11 @@ The following command showcases how to restore a backup:
 ./mongo_backup_manager.sh restore backups_temp/mongo_backup_2024-11-20_13-28-59.gz
 ```
 
-You can optionally restore a specific collection from the backup into a different collection name on the destination database by passing the source collection name (as in the backup) and the desired destination collection name:
+You can optionally remap a namespace by specifying source database and collection, then destination database and collection (all four arguments are required together):
 ```bash
-./mongo_backup_manager.sh restore backups_temp/mongo_backup_2024-11-20_13-28-59.gz user_tasks user_tasks_imported
+./mongo_backup_manager.sh restore backups_temp/mongo_backup_2024-11-20_13-28-59.gz new-world users my-app stateful_users
 ```
-This restores the `user_tasks` collection from the archive into a collection named `user_tasks_imported` in the destination database (other collections in the backup are still restored with their original names).
+This restores the collection `new-world.users` from the archive into `my-app.stateful_users` on the destination. The script will show: `Remapping namespace: new-world.users -> my-app.stateful_users`.
 
 Example output:
 ```
