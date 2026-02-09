@@ -169,7 +169,7 @@ You can optionally remap a namespace by specifying source database and collectio
 ```bash
 ./mongo_backup_manager.sh restore backups_temp/mongo_backup_2024-11-20_13-28-59.gz new-world users my-app stateful_users
 ```
-This restores the collection `new-world.users` from the archive into `my-app.stateful_users` on the destination. The script will show: `Remapping namespace: new-world.users -> my-app.stateful_users`.
+This restores the collection `new-world.users` from the archive into `my-app.stateful_users` on the destination. The script will show: `Remapping namespace: new-world.users -> my-app.stateful_users`. The MongoDB user in `.env` must have **readWrite** (or at least `listCollections` and insert) on the **destination** database (e.g. `my-app`), or you will get "Command listCollections requires authentication".
 
 Example output:
 ```

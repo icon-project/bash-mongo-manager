@@ -182,6 +182,7 @@ restore() {
     NS_REMAP_ARGS="--nsFrom=\"${RESTORE_SOURCE_DB}.${RESTORE_SOURCE_COLLECTION}\" --nsTo=\"${RESTORE_DEST_DB}.${RESTORE_DEST_COLLECTION}\""
     RESTORE_DB_ARG="--db=$RESTORE_SOURCE_DB"
     echo "Remapping namespace: ${RESTORE_SOURCE_DB}.${RESTORE_SOURCE_COLLECTION} -> ${RESTORE_DEST_DB}.${RESTORE_DEST_COLLECTION}"
+    echo "Note: MongoDB user must have readWrite on destination database '${RESTORE_DEST_DB}'."
   fi
 
   docker exec "$CONTAINER_NAME" sh -c "mongorestore --archive=/tmp/$(basename $RESTORE_FILE) --gzip --drop $MONGO_AUTH_ARGS $RESTORE_DB_ARG $NS_REMAP_ARGS"
