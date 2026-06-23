@@ -29,9 +29,28 @@ else
   exit 1
 fi
 
-# Normalize feature flags with defaults
-USE_CREDENTIALS=$(echo "${USE_CREDENTIALS:-true}" | tr '[:upper:]' '[:lower:]')
-USE_REMOTE=$(echo "${USE_REMOTE:-true}" | tr '[:upper:]' '[:lower:]')
+# Strip ONLY Windows CR characters from a value. A .env saved with CRLF line
+# endings otherwise leaves a trailing "\r" on every sourced variable, which
+# silently breaks docker exec (container "not found"), auth, and the S3 path.
+# We strip only CR on purpose — never trim other whitespace, which could corrupt
+# a legitimate password.
+strip_cr() {
+  local s="${1-}"
+  printf '%s' "${s//$'\r'/}"
+}
+
+# Normalize feature flags with defaults (and strip any CR from CRLF .env files)
+USE_CREDENTIALS=$(strip_cr "$(echo "${USE_CREDENTIALS:-true}" | tr '[:upper:]' '[:lower:]')")
+USE_REMOTE=$(strip_cr "$(echo "${USE_REMOTE:-true}" | tr '[:upper:]' '[:lower:]')")
+
+# Sanitize the remaining variables sourced from .env (CR only)
+CONTAINER_NAME=$(strip_cr "${CONTAINER_NAME:-}")
+MONGO_PORT=$(strip_cr "${MONGO_PORT:-}")
+MONGO_DB_NAME=$(strip_cr "${MONGO_DB_NAME:-}")
+MONGO_USER=$(strip_cr "${MONGO_USER:-}")
+MONGO_PASSWORD=$(strip_cr "${MONGO_PASSWORD:-}")
+S3_BUCKET_NAME=$(strip_cr "${S3_BUCKET_NAME:-}")
+AWS_PROFILE=$(strip_cr "${AWS_PROFILE:-}")
 
 # Function to check if the required environment variables are set correctly
 health_check() {
@@ -160,6 +179,37 @@ restore() {
       echo "Error: For namespace remapping you must specify all four: source_db source_collection dest_db dest_collection."
       exit 1
     fi
+  fi
+
+  # Determine the database the restore will write into.
+  local TARGET_DB
+  if [ -n "$RESTORE_DEST_DB" ]; then
+    TARGET_DB="$RESTORE_DEST_DB"
+  else
+    TARGET_DB="$MONGO_DB_NAME"
+  fi
+
+  # Preflight: fail fast with a clear message if the configured credentials
+  # can't reach the destination database, instead of failing partway through
+  # mongorestore with a confusing "listCollections requires authentication".
+  # DB names can't contain quotes/backslashes, so interpolating TARGET_DB into
+  # the eval is safe. Skipped when mongosh isn't available in the container.
+  if docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
+    echo "Preflight: checking auth against destination database '${TARGET_DB}'..."
+    local PREFLIGHT_AUTH=()
+    if [ "$USE_CREDENTIALS" != "false" ]; then
+      PREFLIGHT_AUTH=( --username "$MONGO_USER" --password "$MONGO_PASSWORD" --authenticationDatabase admin )
+    fi
+    if docker exec "$CONTAINER_NAME" mongosh --quiet "${PREFLIGHT_AUTH[@]}" \
+        --eval "quit((db.getSiblingDB('${TARGET_DB}').runCommand({ listCollections: 1 }).ok === 1) ? 0 : 1)" >/dev/null 2>&1; then
+      echo "Preflight auth check passed."
+    else
+      echo "Error: preflight auth check failed for database '${TARGET_DB}'."
+      echo "The MongoDB user in .env needs readWrite (or at least listCollections) on '${TARGET_DB}'."
+      exit 1
+    fi
+  else
+    echo "Preflight: mongosh not found in container; skipping auth preflight."
   fi
 
   echo "Copying MongoDB backup file to the container..."
