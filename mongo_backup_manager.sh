@@ -251,20 +251,29 @@ const dstCol = "${DST_COL}";
 
 // Canonical stringify: sort object keys recursively so field order never
 // produces false mismatches. The index "key" field is order-sensitive
-// (compound indexes), so preserve its insertion order.
+// (compound indexes), so preserve its insertion order. Only *plain* objects
+// are recursed into; BSON scalar wrappers (Date, ObjectId, Long, Decimal128,
+// etc.) carry their value in a non-enumerable form and would collapse to "{}"
+// if recursed, so serialize them with EJSON (falling back to JSON) to keep
+// distinct values distinct in e.g. a partialFilterExpression Date threshold.
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v)
+    && Object.getPrototypeOf(v) === Object.prototype;
+}
 function rawKey(o) {
   return "{" + Object.keys(o).map(function (k) {
     return JSON.stringify(k) + ":" + canon(o[k]);
   }).join(",") + "}";
 }
 function canon(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
   if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
-  if (v && typeof v === "object") {
+  if (isPlainObject(v)) {
     return "{" + Object.keys(v).sort().map(function (k) {
       return JSON.stringify(k) + ":" + (k === "key" ? rawKey(v[k]) : canon(v[k]));
     }).join(",") + "}";
   }
-  return JSON.stringify(v);
+  return (typeof EJSON !== "undefined") ? EJSON.stringify(v) : JSON.stringify(v);
 }
 function normIndexes(idxs) {
   return idxs.map(function (i) {
