@@ -57,11 +57,16 @@ There is no linter configured; if changing the script, validate manually with
 - **Verify flow**: `verify` runs entirely inside the container via `docker exec ... mongosh
   --eval`, reaching both namespaces with `getSiblingDB`. The JS canonicalizes each index
   (strips `v`/`ns`, recursively sorts object keys but preserves the order-sensitive `key`
-  field), compares the normalized index-set plus `countDocuments`, and `quit(1)`s on any
-  mismatch — the bash wrapper turns that into a non-zero script exit. mongosh uses
-  space-separated auth flags (`build_mongosh_auth_args`), unlike mongodump/mongorestore which
-  take `--flag=val` (`build_mongo_auth_args`). The eval heredoc is **unquoted** so the four
-  `${...}` namespace names expand — keep that JS free of `$` and backticks.
+  field; non-plain objects like BSON `Date`/`ObjectId` are serialized with `EJSON` so distinct
+  scalar values stay distinct), compares the normalized index-set plus `countDocuments`, and
+  `quit(1)`s on any mismatch — the bash wrapper turns that into a non-zero script exit. mongosh
+  uses space-separated auth flags (`build_mongosh_auth_args`), unlike mongodump/mongorestore
+  which take `--flag=val` (`build_mongo_auth_args`). The JS logic lives in a **quoted**
+  (`<<'EOF'`) heredoc — so the shell does no expansion and the JS may use `$`/backticks freely —
+  and the four namespace names are prepended as a prelude of JSON-encoded JS string literals
+  (`json_str`), so a db/collection name containing a quote or backslash can't break or alter
+  the script. Keep that split intact when editing: logic in the quoted heredoc, names via the
+  escaped prelude — never interpolate raw names into the JS.
 - **Directories**: `./backups` (local dumps, git-kept but contents gitignored), `./backups_temp`
   (S3 downloads land here), `./logs` (run separators appended per invocation; gitignored).
 - `.env`, `*.gz`, and backup dir contents are all gitignored — never commit them.
