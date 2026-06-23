@@ -10,6 +10,7 @@ This script automates the process of backing up a MongoDB database running in a 
 - Uploads backups to an AWS S3 bucket.
 - Automatically cleans up old backups from the local directory (optional).
 - Restores a backup to the MongoDB database.
+- Verifies count and full index-spec parity between two namespaces after a restore/migration.
 ---
 
 ## Prerequisites
@@ -188,6 +189,51 @@ MongoDB restore completed successfully.
 Cleaning up temporary backup file in the container...
 Restore completed successfully.
 ```
+
+### Verifying a Restore
+
+After a restore — especially a namespace remap during a migration — use the `verify` command to **prove** that the target namespace matches the source rather than trusting that `mongorestore` recreated everything correctly:
+
+```bash
+./mongo_backup_manager.sh verify <source_db> <source_collection> <dest_db> <dest_collection>
+```
+
+The argument order mirrors the `restore` remap, so you can run the same source/dest pair you just restored:
+
+```bash
+./mongo_backup_manager.sh verify sodax-registration users new-world stateful_users
+```
+
+`verify` connects to the running MongoDB via `mongosh` inside the container and compares:
+
+- **Document count** (`countDocuments`) of both collections.
+- **The full index spec** of every index — name, key, `unique`, `sparse`, `partialFilterExpression`, `collation`, and TTL (`expireAfterSeconds`). The cosmetic `v` (index version) and `ns` (namespace, which legitimately differs across DBs) fields are stripped before comparison, and field ordering is normalized so only meaningful differences are reported.
+
+This catches mismatches a names-only check would miss — for example a `unique` index on `stateful_partner_naming.name` that lost its `sparse: true`, which would otherwise pass review and later throw duplicate-key errors on rows whose `name` is `null`.
+
+The command **exits non-zero on any mismatch**, so it can gate a migration script or run in CI. Example output on success:
+
+```
+Performing health check...
+Health check passed! All required variables are set.
+Verifying sodax-registration.users -> new-world.stateful_users...
+source sodax-registration.users: count=8 indexes=3
+target new-world.stateful_users: count=8 indexes=3
+VERIFY OK: document counts and full index specs match.
+Verification passed.
+```
+
+And on a mismatch (note identical counts and index *names* — only the spec differs):
+
+```
+target new-world.stateful_users: count=8 indexes=3
+VERIFY FAILED:
+  - index on source missing/differs on target: {"key":{"name":1},"name":"name_1","sparse":true,"unique":true}
+  - index on target absent/differs on source: {"key":{"name":1},"name":"name_1","unique":true}
+Verification failed.
+```
+
+> The MongoDB user in `.env` needs read access (e.g. `read`) on **both** the source and destination databases. `verify` requires `mongosh` to be available inside the container (included in the official `mongo` images from 5.0+).
 
 ## Setting up backups with cron
 

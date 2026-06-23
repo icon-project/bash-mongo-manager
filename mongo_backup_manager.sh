@@ -80,6 +80,16 @@ build_mongo_auth_args() {
   fi
 }
 
+# Helper: build mongosh auth args as an array. mongosh uses space-separated
+# flags (its CLI parser differs from mongodump/mongorestore which accept --flag=val).
+build_mongosh_auth_args() {
+  local -n _out=$1
+  _out=()
+  if [ "$USE_CREDENTIALS" != "false" ]; then
+    _out+=( "--username" "$MONGO_USER" "--password" "$MONGO_PASSWORD" "--authenticationDatabase" "admin" )
+  fi
+}
+
 # Function to perform backup
 backup() {
   echo "Starting MongoDB backup at $TIMESTAMP..."
@@ -205,6 +215,100 @@ restore() {
   echo "Restore completed successfully."
 }
 
+# Function to verify count + full index-spec parity between a source and a
+# (restored) target namespace, both reachable from CONTAINER_NAME's mongod.
+# Usage: verify <src_db> <src_col> <dst_db> <dst_col>
+# Exits non-zero if document counts differ or any index spec differs.
+# Index comparison strips the cosmetic `v` and `ns` fields (ns legitimately
+# differs across DBs) and compares the full remaining spec: name, key,
+# unique, sparse, partialFilterExpression, collation, TTL (expireAfterSeconds).
+verify() {
+  if [ -z "${1:-}" ] || [ -z "${2:-}" ] || [ -z "${3:-}" ] || [ -z "${4:-}" ]; then
+    echo "Error: verify requires all four arguments: <src_db> <src_col> <dst_db> <dst_col>."
+    exit 1
+  fi
+
+  local SRC_DB=$1
+  local SRC_COL=$2
+  local DST_DB=$3
+  local DST_COL=$4
+
+  echo "Verifying ${SRC_DB}.${SRC_COL} -> ${DST_DB}.${DST_COL}..."
+
+  local AUTH_ARGS=()
+  build_mongosh_auth_args AUTH_ARGS
+
+  # The eval script runs inside the container's mongosh. Both namespaces are
+  # reached via getSiblingDB on the same connection. It prints a summary and
+  # quit()s non-zero on any mismatch. Avoid '$' and backticks here so the
+  # (unquoted) heredoc only expands the four ${...} names below.
+  local JS
+  JS=$(cat <<EOF
+const srcDb = db.getSiblingDB("${SRC_DB}");
+const dstDb = db.getSiblingDB("${DST_DB}");
+const srcCol = "${SRC_COL}";
+const dstCol = "${DST_COL}";
+
+// Canonical stringify: sort object keys recursively so field order never
+// produces false mismatches. The index "key" field is order-sensitive
+// (compound indexes), so preserve its insertion order.
+function rawKey(o) {
+  return "{" + Object.keys(o).map(function (k) {
+    return JSON.stringify(k) + ":" + canon(o[k]);
+  }).join(",") + "}";
+}
+function canon(v) {
+  if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+  if (v && typeof v === "object") {
+    return "{" + Object.keys(v).sort().map(function (k) {
+      return JSON.stringify(k) + ":" + (k === "key" ? rawKey(v[k]) : canon(v[k]));
+    }).join(",") + "}";
+  }
+  return JSON.stringify(v);
+}
+function normIndexes(idxs) {
+  return idxs.map(function (i) {
+    const c = {};
+    Object.keys(i).forEach(function (k) { if (k !== "v" && k !== "ns") c[k] = i[k]; });
+    return c;
+  }).map(canon).sort();
+}
+
+const srcCount = srcDb.getCollection(srcCol).countDocuments({});
+const dstCount = dstDb.getCollection(dstCol).countDocuments({});
+const srcIdx = normIndexes(srcDb.getCollection(srcCol).getIndexes());
+const dstIdx = normIndexes(dstDb.getCollection(dstCol).getIndexes());
+
+const problems = [];
+if (srcCount !== dstCount) {
+  problems.push("count mismatch: source=" + srcCount + " target=" + dstCount);
+}
+const dstSet = new Set(dstIdx);
+const srcSet = new Set(srcIdx);
+srcIdx.forEach(function (s) { if (!dstSet.has(s)) problems.push("index on source missing/differs on target: " + s); });
+dstIdx.forEach(function (d) { if (!srcSet.has(d)) problems.push("index on target absent/differs on source: " + d); });
+
+print("source " + srcDb.getName() + "." + srcCol + ": count=" + srcCount + " indexes=" + srcIdx.length);
+print("target " + dstDb.getName() + "." + dstCol + ": count=" + dstCount + " indexes=" + dstIdx.length);
+
+if (problems.length) {
+  print("VERIFY FAILED:");
+  problems.forEach(function (p) { print("  - " + p); });
+  quit(1);
+}
+print("VERIFY OK: document counts and full index specs match.");
+quit(0);
+EOF
+)
+
+  if docker exec "$CONTAINER_NAME" mongosh --quiet "${AUTH_ARGS[@]}" --eval "$JS"; then
+    echo "Verification passed."
+  else
+    echo "Verification failed."
+    exit 1
+  fi
+}
+
 # Function to download a backup from S3 and put it in the S3_BACKUP_DIR_TEMP
 download_backup() {
   if [ -z "${1:-}" ]; then
@@ -241,6 +345,8 @@ help() {
   echo "  backup                 Perform a MongoDB backup and upload it to S3."
   echo "  restore [file] [source_db] [source_collection] [dest_db] [dest_collection]"
   echo "                         Restore a MongoDB backup. Optionally remap a namespace (all four required)."
+  echo "  verify [source_db] [source_collection] [dest_db] [dest_collection]"
+  echo "                         Compare counts and full index specs between two namespaces; exits non-zero on mismatch."
   echo "  list_backups_s3        List all backups available in the S3 bucket."
   echo "  list_backups_local     List all backups in the local backup directory."
   echo "  download_backup [file] Download a backup from S3 and store it locally."
@@ -254,6 +360,7 @@ help() {
   echo "  ./mongo_backup_manager.sh backup"
   echo "  ./mongo_backup_manager.sh restore ./backups/mongo_backup_2026-02-09_08-56-18.gz"
   echo "  ./mongo_backup_manager.sh restore ./backups/mongo_backup_2026-02-09_08-56-18.gz sodax-registration users new-world stateful_users"
+  echo "  ./mongo_backup_manager.sh verify sodax-registration users new-world stateful_users"
 }
 
 # Call the help function if the script is run without arguments or with the 'help' command
@@ -280,6 +387,10 @@ case "$1" in
     health_check
     restore "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
     ;;
+  verify)
+    health_check
+    verify "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+    ;;
   download_backup)
     health_check
     download_backup "${2:-}"
@@ -288,7 +399,7 @@ case "$1" in
     help
     ;;
   *)
-    echo "Usage: $0 {backup|restore|list_backups_s3|list_backups_local|download_backup|help} [args]"
+    echo "Usage: $0 {backup|restore|verify|list_backups_s3|list_backups_local|download_backup|help} [args]"
     exit 1
     ;;
 esac
