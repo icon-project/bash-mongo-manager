@@ -90,6 +90,18 @@ build_mongosh_auth_args() {
   fi
 }
 
+# Helper: emit a value as a JSON/JS string literal (quoted, with backslashes and
+# double quotes escaped). Used so a db/collection name containing a quote or
+# backslash can't break or alter the JS we hand to mongosh. Order matters:
+# escape backslashes before quotes. (Mongo namespaces can't contain control
+# characters, so escaping \ and " is sufficient.)
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '"%s"' "$s"
+}
+
 # Function to perform backup
 backup() {
   echo "Starting MongoDB backup at $TIMESTAMP..."
@@ -238,16 +250,22 @@ verify() {
   local AUTH_ARGS=()
   build_mongosh_auth_args AUTH_ARGS
 
+  # JSON-encode the four names into JS string literals so that names containing
+  # quotes or backslashes can't break or alter the script (JSON strings are
+  # valid JS string literals). The prelude is assembled separately and prepended
+  # to the logic body, which lives in a *quoted* heredoc — no shell expansion,
+  # so the JS may use '$'/backticks freely and the names are never re-expanded.
+  local SRC_DB_JS SRC_COL_JS DST_DB_JS DST_COL_JS
+  SRC_DB_JS=$(json_str "$SRC_DB")
+  SRC_COL_JS=$(json_str "$SRC_COL")
+  DST_DB_JS=$(json_str "$DST_DB")
+  DST_COL_JS=$(json_str "$DST_COL")
+
   # The eval script runs inside the container's mongosh. Both namespaces are
   # reached via getSiblingDB on the same connection. It prints a summary and
-  # quit()s non-zero on any mismatch. Avoid '$' and backticks here so the
-  # (unquoted) heredoc only expands the four ${...} names below.
-  local JS
-  JS=$(cat <<EOF
-const srcDb = db.getSiblingDB("${SRC_DB}");
-const dstDb = db.getSiblingDB("${DST_DB}");
-const srcCol = "${SRC_COL}";
-const dstCol = "${DST_COL}";
+  # quit()s non-zero on any mismatch.
+  local JS_BODY
+  JS_BODY=$(cat <<'EOF'
 
 // Canonical stringify: sort object keys recursively so field order never
 // produces false mismatches. The index "key" field is order-sensitive
@@ -309,6 +327,13 @@ print("VERIFY OK: document counts and full index specs match.");
 quit(0);
 EOF
 )
+
+  # Prepend the namespace bindings (JSON literals) to the logic body.
+  local JS="const srcDb = db.getSiblingDB(${SRC_DB_JS});
+const dstDb = db.getSiblingDB(${DST_DB_JS});
+const srcCol = ${SRC_COL_JS};
+const dstCol = ${DST_COL_JS};
+${JS_BODY}"
 
   if docker exec "$CONTAINER_NAME" mongosh --quiet "${AUTH_ARGS[@]}" --eval "$JS"; then
     echo "Verification passed."
