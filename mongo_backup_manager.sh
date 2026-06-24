@@ -346,9 +346,15 @@ restore() {
       # Restore only the named collections from the configured DB (one
       # --nsInclude each). --drop only drops the collections being restored.
       echo "Restoring collections into ${MONGO_DB_NAME}: ${COLLECTIONS[*]}"
-      local col
+      local col col_esc
       for col in "${COLLECTIONS[@]}"; do
-        RESTORE_ARGS+=( "--nsInclude=${MONGO_DB_NAME}.${col}" )
+        # --nsInclude is a namespace *pattern* where '*' is a wildcard and '\'
+        # escapes it. Escape '\' then '*' in the collection name so a name like
+        # 'foo*' matches only itself, not 'foo1'/'foobar'. (DB names can't
+        # contain these characters, so only the collection part needs escaping.)
+        col_esc="${col//\\/\\\\}"
+        col_esc="${col_esc//\*/\\*}"
+        RESTORE_ARGS+=( "--nsInclude=${MONGO_DB_NAME}.${col_esc}" )
       done
       ;;
     *)
