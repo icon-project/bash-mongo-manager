@@ -128,60 +128,56 @@ backup() {
     fi
     echo "Backing up collections from ${MONGO_DB_NAME}: ${COLLECTIONS[*]}"
 
-    if [ "${#COLLECTIONS[@]}" -eq 1 ]; then
-      # mongodump can dump a single collection directly.
-      DUMP_ARGS+=( "--db=$MONGO_DB_NAME" "--collection=${COLLECTIONS[0]}" )
-    else
-      # mongodump can't include multiple specific collections in one pass, so
-      # dump the whole DB minus every collection that wasn't requested. Building
-      # that exclude list needs the full collection list, which we read with
-      # mongosh.
-      if ! docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
-        echo "Error: backing up more than one collection needs mongosh inside container '${CONTAINER_NAME}'."
-        echo "       Back them up one at a time, or use a container image that includes mongosh."
-        exit 1
+    # mongodump can't include multiple specific collections in one pass, and a
+    # single --collection silently "succeeds" (empty archive) when the name is
+    # missing. So for any subset, enumerate the DB's collections with mongosh,
+    # validate the requested names, and dump the whole DB minus everything not
+    # requested.
+    if ! docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
+      echo "Error: backing up a collection subset needs mongosh inside container '${CONTAINER_NAME}'."
+      echo "       Use a container image that includes mongosh, or back up the whole DB."
+      exit 1
+    fi
+
+    local MONGOSH_AUTH=()
+    if [ "$USE_CREDENTIALS" != "false" ]; then
+      MONGOSH_AUTH=( --username "$MONGO_USER" --password "$MONGO_PASSWORD" --authenticationDatabase admin )
+    fi
+    # JSON-escape the DB name into a JS string literal (see restore preflight).
+    local DB_ESC="${MONGO_DB_NAME//\\/\\\\}"
+    DB_ESC="${DB_ESC//\"/\\\"}"
+
+    local ALL_COLLECTIONS
+    ALL_COLLECTIONS=$(docker exec "$CONTAINER_NAME" mongosh --quiet "${MONGOSH_AUTH[@]}" \
+      --eval "db.getSiblingDB(\"${DB_ESC}\").getCollectionNames().forEach(function (n) { print(n); })")
+
+    # Warn about requested collections that don't exist.
+    local req
+    for req in "${COLLECTIONS[@]}"; do
+      if ! printf '%s\n' "$ALL_COLLECTIONS" | grep -qxF -- "$req"; then
+        echo "Warning: requested collection '$req' not found in ${MONGO_DB_NAME}; skipping."
       fi
+    done
 
-      local MONGOSH_AUTH=()
-      if [ "$USE_CREDENTIALS" != "false" ]; then
-        MONGOSH_AUTH=( --username "$MONGO_USER" --password "$MONGO_PASSWORD" --authenticationDatabase admin )
-      fi
-      # JSON-escape the DB name into a JS string literal (see restore preflight).
-      local DB_ESC="${MONGO_DB_NAME//\\/\\\\}"
-      DB_ESC="${DB_ESC//\"/\\\"}"
-
-      local ALL_COLLECTIONS
-      ALL_COLLECTIONS=$(docker exec "$CONTAINER_NAME" mongosh --quiet "${MONGOSH_AUTH[@]}" \
-        --eval "db.getSiblingDB(\"${DB_ESC}\").getCollectionNames().forEach(function (n) { print(n); })")
-
-      # Warn about requested collections that don't exist.
-      local req
-      for req in "${COLLECTIONS[@]}"; do
-        if ! printf '%s\n' "$ALL_COLLECTIONS" | grep -qxF -- "$req"; then
-          echo "Warning: requested collection '$req' not found in ${MONGO_DB_NAME}; skipping."
-        fi
+    # Exclude every existing collection that wasn't requested.
+    DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
+    local kept=0 existing want
+    while IFS= read -r existing; do
+      [ -z "$existing" ] && continue
+      local keep=0
+      for want in "${COLLECTIONS[@]}"; do
+        if [ "$existing" = "$want" ]; then keep=1; break; fi
       done
-
-      # Exclude every existing collection that wasn't requested.
-      DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
-      local kept=0 existing want
-      while IFS= read -r existing; do
-        [ -z "$existing" ] && continue
-        local keep=0
-        for want in "${COLLECTIONS[@]}"; do
-          if [ "$existing" = "$want" ]; then keep=1; break; fi
-        done
-        if [ "$keep" -eq 1 ]; then
-          kept=$((kept + 1))
-        else
-          DUMP_ARGS+=( "--excludeCollection=$existing" )
-        fi
-      done <<< "$ALL_COLLECTIONS"
-
-      if [ "$kept" -eq 0 ]; then
-        echo "Error: none of the requested collections exist in ${MONGO_DB_NAME}."
-        exit 1
+      if [ "$keep" -eq 1 ]; then
+        kept=$((kept + 1))
+      else
+        DUMP_ARGS+=( "--excludeCollection=$existing" )
       fi
+    done <<< "$ALL_COLLECTIONS"
+
+    if [ "$kept" -eq 0 ]; then
+      echo "Error: none of the requested collections exist in ${MONGO_DB_NAME}."
+      exit 1
     fi
   else
     DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
