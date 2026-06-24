@@ -179,16 +179,21 @@ restore() {
   # Preflight: fail fast with a clear message if the configured credentials
   # can't reach the destination database, instead of failing partway through
   # mongorestore with a confusing "listCollections requires authentication".
-  # DB names can't contain quotes/backslashes, so interpolating TARGET_DB into
-  # the eval is safe. Skipped when mongosh isn't available in the container.
+  # Skipped when mongosh isn't available in the container.
   if docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
     echo "Preflight: checking auth against destination database '${TARGET_DB}'..."
     local PREFLIGHT_AUTH=()
     if [ "$USE_CREDENTIALS" != "false" ]; then
       PREFLIGHT_AUTH=( --username "$MONGO_USER" --password "$MONGO_PASSWORD" --authenticationDatabase admin )
     fi
+    # JSON-escape the DB name into a JS string literal so a name containing a
+    # single quote (valid in MongoDB DB names) can't build malformed --eval JS.
+    # Escape backslash first, then double quote (both forbidden in DB names, but
+    # handled defensively), and embed inside double quotes.
+    local TARGET_DB_ESC="${TARGET_DB//\\/\\\\}"
+    TARGET_DB_ESC="${TARGET_DB_ESC//\"/\\\"}"
     if docker exec "$CONTAINER_NAME" mongosh --quiet "${PREFLIGHT_AUTH[@]}" \
-        --eval "quit((db.getSiblingDB('${TARGET_DB}').runCommand({ listCollections: 1 }).ok === 1) ? 0 : 1)" >/dev/null 2>&1; then
+        --eval "quit((db.getSiblingDB(\"${TARGET_DB_ESC}\").runCommand({ listCollections: 1 }).ok === 1) ? 0 : 1)" >/dev/null 2>&1; then
       echo "Preflight auth check passed."
     else
       echo "Error: preflight auth check failed for database '${TARGET_DB}'."
