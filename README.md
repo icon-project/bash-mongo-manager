@@ -95,6 +95,8 @@ USE_REMOTE="true"      # set to false to skip all S3 interactions
 | `USE_CREDENTIALS`  | When `false`, skips MongoDB username/password in dump/restore commands. Defaults to `true`.|
 | `USE_REMOTE`       | When `false`, skips all S3 upload/download/list actions. Defaults to `true`.|
 
+> If your `.env` is saved with Windows (CRLF) line endings, the script strips the trailing carriage return from these values automatically, so a stray `\r` won't break the container name, port, or S3 path. Only the CR is removed — other whitespace (e.g. inside a password) is preserved as-is.
+
 ---
 
 ## How to Use
@@ -171,6 +173,8 @@ You can optionally remap a namespace by specifying source database and collectio
 ./mongo_backup_manager.sh restore backups_temp/mongo_backup_2024-11-20_13-28-59.gz new-world users my-app stateful_users
 ```
 This restores the collection `new-world.users` from the archive into `my-app.stateful_users` on the destination. The script will show: `Remapping namespace: new-world.users -> my-app.stateful_users`. The MongoDB user in `.env` must have **readWrite** (or at least `listCollections` and insert) on the **destination** database (e.g. `my-app`), or you will get "Command listCollections requires authentication".
+
+Before copying or restoring anything, `restore` runs a **preflight auth check**: it uses `mongosh` to confirm the configured credentials can reach the destination database (the remap target, or `MONGO_DB_NAME` for a plain restore) and aborts with a clear message if they can't — so a permissions problem fails fast instead of partway through `mongorestore`. The preflight is skipped automatically if `mongosh` isn't available inside the container.
 
 Example output:
 ```

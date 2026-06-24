@@ -21,8 +21,14 @@ mkdir -p "$(dirname "$LOG_FILE")"
 ENV_FILE="${SCRIPT_DIR}/.env"
 if [ -f "$ENV_FILE" ]; then
   set -a
+  # Source with carriage returns stripped so a .env saved with Windows (CRLF)
+  # line endings can't break us. Stripping at source time (not after) is what
+  # matters: a blank CRLF line would otherwise make bash try to run $'\r' as a
+  # command and abort under `set -e`, and values would carry a trailing "\r"
+  # that silently breaks docker exec, auth, and the S3 path. Removing only CR
+  # never touches meaningful whitespace inside a value (e.g. a password).
   # shellcheck disable=SC1090
-  source "$ENV_FILE"
+  source <(tr -d '\r' < "$ENV_FILE")
   set +a
 else
   echo "Error: The .env file is missing. Please create the .env file with the required environment variables."
@@ -182,6 +188,42 @@ restore() {
       echo "Error: For namespace remapping you must specify all four: source_db source_collection dest_db dest_collection."
       exit 1
     fi
+  fi
+
+  # Determine the database the restore will write into.
+  local TARGET_DB
+  if [ -n "$RESTORE_DEST_DB" ]; then
+    TARGET_DB="$RESTORE_DEST_DB"
+  else
+    TARGET_DB="$MONGO_DB_NAME"
+  fi
+
+  # Preflight: fail fast with a clear message if the configured credentials
+  # can't reach the destination database, instead of failing partway through
+  # mongorestore with a confusing "listCollections requires authentication".
+  # Skipped when mongosh isn't available in the container.
+  if docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
+    echo "Preflight: checking auth against destination database '${TARGET_DB}'..."
+    local PREFLIGHT_AUTH=()
+    if [ "$USE_CREDENTIALS" != "false" ]; then
+      PREFLIGHT_AUTH=( --username "$MONGO_USER" --password "$MONGO_PASSWORD" --authenticationDatabase admin )
+    fi
+    # JSON-escape the DB name into a JS string literal so a name containing a
+    # single quote (valid in MongoDB DB names) can't build malformed --eval JS.
+    # Escape backslash first, then double quote (both forbidden in DB names, but
+    # handled defensively), and embed inside double quotes.
+    local TARGET_DB_ESC="${TARGET_DB//\\/\\\\}"
+    TARGET_DB_ESC="${TARGET_DB_ESC//\"/\\\"}"
+    if docker exec "$CONTAINER_NAME" mongosh --quiet "${PREFLIGHT_AUTH[@]}" \
+        --eval "quit((db.getSiblingDB(\"${TARGET_DB_ESC}\").runCommand({ listCollections: 1 }).ok === 1) ? 0 : 1)" >/dev/null 2>&1; then
+      echo "Preflight auth check passed."
+    else
+      echo "Error: preflight auth check failed for database '${TARGET_DB}'."
+      echo "The MongoDB user in .env needs readWrite (or at least listCollections) on '${TARGET_DB}'."
+      exit 1
+    fi
+  else
+    echo "Preflight: mongosh not found in container; skipping auth preflight."
   fi
 
   echo "Copying MongoDB backup file to the container..."
