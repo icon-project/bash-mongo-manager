@@ -123,7 +123,7 @@ To back up only a subset of collections, pass a comma-separated list (no spaces 
 ```bash
 ./mongo_backup_manager.sh backup users,tasks
 ```
-Backing up a collection subset requires `mongosh` inside the container: `mongodump` can't include multiple specific collections in one pass (and a single `--collection` silently produces an empty archive when the name is misspelled), so the script enumerates the database's collections, validates your request, and dumps the whole database minus everything you didn't request. Names not present are skipped with a warning, and it errors (rather than writing an empty archive) if none of the requested collections exist.
+A **single** collection is dumped directly with `mongodump --collection` and needs no `mongosh`; if the name is misspelled the script detects mongodump's "does not exist" report and errors instead of writing an empty archive. Backing up **more than one** collection requires `mongosh` inside the container — `mongodump` can't include multiple specific collections in one pass, so the script enumerates the database's collections and dumps the whole database minus everything you didn't request (names not present are skipped with a warning, and it errors if none of the requested collections exist).
 
 The `list_backups_local` command can be used to list all backups stored locally:
 ```bash

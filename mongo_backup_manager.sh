@@ -128,6 +128,9 @@ backup() {
   build_mongo_auth_args AUTH_ARGS
 
   local DUMP_ARGS=( "--archive=$BACKUP_FILE_NAME" "--gzip" "${AUTH_ARGS[@]}" )
+  # Set to the collection name when we use --collection, so we can detect that
+  # mongodump reported the namespace missing (it exits 0 in that case).
+  local SINGLE_COLLECTION=""
 
   if [ -n "$COLLECTIONS_CSV" ]; then
     local -a COLLECTIONS
@@ -138,63 +141,78 @@ backup() {
     fi
     echo "Backing up collections from ${MONGO_DB_NAME}: ${COLLECTIONS[*]}"
 
-    # mongodump can't include multiple specific collections in one pass, and a
-    # single --collection silently "succeeds" (empty archive) when the name is
-    # missing. So for any subset, enumerate the DB's collections with mongosh,
-    # validate the requested names, and dump the whole DB minus everything not
-    # requested.
-    if ! docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
-      echo "Error: backing up a collection subset needs mongosh inside container '${CONTAINER_NAME}'."
-      echo "       Use a container image that includes mongosh, or back up the whole DB."
-      exit 1
-    fi
-
-    local MONGOSH_AUTH=()
-    if [ "$USE_CREDENTIALS" != "false" ]; then
-      MONGOSH_AUTH=( --username "$MONGO_USER" --password "$MONGO_PASSWORD" --authenticationDatabase admin )
-    fi
-    # JSON-escape the DB name into a JS string literal (see restore preflight).
-    local DB_ESC="${MONGO_DB_NAME//\\/\\\\}"
-    DB_ESC="${DB_ESC//\"/\\\"}"
-
-    local ALL_COLLECTIONS
-    ALL_COLLECTIONS=$(docker exec "$CONTAINER_NAME" mongosh --quiet "${MONGOSH_AUTH[@]}" \
-      --eval "db.getSiblingDB(\"${DB_ESC}\").getCollectionNames().forEach(function (n) { print(n); })")
-
-    # Warn about requested collections that don't exist.
-    local req
-    for req in "${COLLECTIONS[@]}"; do
-      if ! printf '%s\n' "$ALL_COLLECTIONS" | grep -qxF -- "$req"; then
-        echo "Warning: requested collection '$req' not found in ${MONGO_DB_NAME}; skipping."
+    if [ "${#COLLECTIONS[@]}" -eq 1 ]; then
+      # A single collection is dumped directly with --collection, which needs no
+      # mongosh. mongodump exits 0 even when the collection is missing (it logs
+      # "does not exist"), so we validate via the dump output after running it.
+      DUMP_ARGS+=( "--db=$MONGO_DB_NAME" "--collection=${COLLECTIONS[0]}" )
+      SINGLE_COLLECTION="${COLLECTIONS[0]}"
+    else
+      # mongodump can't include multiple specific collections in one pass, so
+      # dump the whole DB minus everything not requested. Building that exclude
+      # list needs the full collection list, which we read with mongosh.
+      if ! docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
+        echo "Error: backing up more than one collection needs mongosh inside container '${CONTAINER_NAME}'."
+        echo "       Back them up one at a time, or use a container image that includes mongosh."
+        exit 1
       fi
-    done
 
-    # Exclude every existing collection that wasn't requested.
-    DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
-    local kept=0 existing want
-    while IFS= read -r existing; do
-      [ -z "$existing" ] && continue
-      local keep=0
-      for want in "${COLLECTIONS[@]}"; do
-        if [ "$existing" = "$want" ]; then keep=1; break; fi
+      local MONGOSH_AUTH=()
+      if [ "$USE_CREDENTIALS" != "false" ]; then
+        MONGOSH_AUTH=( --username "$MONGO_USER" --password "$MONGO_PASSWORD" --authenticationDatabase admin )
+      fi
+      # JSON-escape the DB name into a JS string literal (see restore preflight).
+      local DB_ESC="${MONGO_DB_NAME//\\/\\\\}"
+      DB_ESC="${DB_ESC//\"/\\\"}"
+
+      local ALL_COLLECTIONS
+      ALL_COLLECTIONS=$(docker exec "$CONTAINER_NAME" mongosh --quiet "${MONGOSH_AUTH[@]}" \
+        --eval "db.getSiblingDB(\"${DB_ESC}\").getCollectionNames().forEach(function (n) { print(n); })")
+
+      # Warn about requested collections that don't exist.
+      local req
+      for req in "${COLLECTIONS[@]}"; do
+        if ! printf '%s\n' "$ALL_COLLECTIONS" | grep -qxF -- "$req"; then
+          echo "Warning: requested collection '$req' not found in ${MONGO_DB_NAME}; skipping."
+        fi
       done
-      if [ "$keep" -eq 1 ]; then
-        kept=$((kept + 1))
-      else
-        DUMP_ARGS+=( "--excludeCollection=$existing" )
-      fi
-    done <<< "$ALL_COLLECTIONS"
 
-    if [ "$kept" -eq 0 ]; then
-      echo "Error: none of the requested collections exist in ${MONGO_DB_NAME}."
-      exit 1
+      # Exclude every existing collection that wasn't requested.
+      DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
+      local kept=0 existing want
+      while IFS= read -r existing; do
+        [ -z "$existing" ] && continue
+        local keep=0
+        for want in "${COLLECTIONS[@]}"; do
+          if [ "$existing" = "$want" ]; then keep=1; break; fi
+        done
+        if [ "$keep" -eq 1 ]; then
+          kept=$((kept + 1))
+        else
+          DUMP_ARGS+=( "--excludeCollection=$existing" )
+        fi
+      done <<< "$ALL_COLLECTIONS"
+
+      if [ "$kept" -eq 0 ]; then
+        echo "Error: none of the requested collections exist in ${MONGO_DB_NAME}."
+        exit 1
+      fi
     fi
   else
     DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
   fi
 
-  # Run the MongoDB dump command inside the container (NO sh -c; pass args directly)
-  docker exec "$CONTAINER_NAME" mongodump "${DUMP_ARGS[@]}"
+  # Run the MongoDB dump command inside the container (NO sh -c; pass args
+  # directly). Capture output so we can detect a missing single collection,
+  # which mongodump reports without a non-zero exit. (local on its own line so
+  # the assignment's exit status still triggers set -e on a real dump failure.)
+  local DUMP_OUTPUT
+  DUMP_OUTPUT=$(docker exec "$CONTAINER_NAME" mongodump "${DUMP_ARGS[@]}" 2>&1)
+  printf '%s\n' "$DUMP_OUTPUT"
+  if [ -n "$SINGLE_COLLECTION" ] && printf '%s\n' "$DUMP_OUTPUT" | grep -q "does not exist"; then
+    echo "Error: collection '${SINGLE_COLLECTION}' does not exist in ${MONGO_DB_NAME}; nothing was backed up."
+    exit 1
+  fi
 
   echo "MongoDB dump completed successfully."
 
