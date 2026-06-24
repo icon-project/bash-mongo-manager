@@ -107,7 +107,17 @@ split_csv() {
 # collections: optional comma-separated list of collections in MONGO_DB_NAME to
 # back up (e.g. "users,tasks"). When omitted, the whole database is dumped.
 backup() {
-  local COLLECTIONS_CSV=${1:-}
+  # An argument is present only if the caller actually passed one, so an
+  # explicitly empty selector (e.g. backup "" from an unset variable) is
+  # rejected rather than silently backing up the whole DB.
+  local COLLECTIONS_CSV=""
+  if [ "$#" -ge 1 ]; then
+    if [ -z "$1" ]; then
+      echo "Error: empty collection list. Pass a non-empty comma-separated list, or omit it to back up the whole DB."
+      exit 1
+    fi
+    COLLECTIONS_CSV="$1"
+  fi
 
   echo "Starting MongoDB backup at $TIMESTAMP..."
 
@@ -237,40 +247,52 @@ restore() {
   fi
 
   local RESTORE_FILE=$1
-  local A2=${2:-} A3=${3:-} A4=${4:-} A5=${5:-}
+  # Mode is selected by the *count* of arguments after the file, which the caller
+  # preserves by forwarding the real args. This distinguishes "no selector" from
+  # an explicitly empty one (e.g. restore <file> "" from an unset variable): the
+  # latter is rejected rather than silently restoring/dropping the whole DB.
+  local nmode=$(( $# - 1 ))
 
   if [ ! -e "$RESTORE_FILE" ]; then
     echo "Error: Backup file $RESTORE_FILE not found in the host."
     exit 1
   fi
 
-  # Determine restore mode from the trailing arguments:
-  #   (none)                                  -> restore the whole configured DB
-  #   <collections>                           -> restore a comma-separated subset
+  # Restore mode by argument count after the file:
+  #   0 args                                  -> restore the whole configured DB
+  #   1 arg  <collections>                    -> restore a comma-separated subset
   #                                              of collections from MONGO_DB_NAME
-  #   <src_db> <src_col> <dst_db> <dst_col>   -> restore one collection, remapping
-  #                                              its namespace
+  #   4 args <src_db> <src_col> <dst_db> <dst_col> -> restore one collection,
+  #                                              remapping its namespace
   local RESTORE_MODE
   local RESTORE_SOURCE_DB="" RESTORE_SOURCE_COLLECTION="" RESTORE_DEST_DB="" RESTORE_DEST_COLLECTION=""
   local -a COLLECTIONS=()
-  if [ -z "$A2" ] && [ -z "$A3" ] && [ -z "$A4" ] && [ -z "$A5" ]; then
+  if [ "$nmode" -eq 0 ]; then
     RESTORE_MODE="all"
-  elif [ -n "$A2" ] && [ -z "$A3" ] && [ -z "$A4" ] && [ -z "$A5" ]; then
+  elif [ "$nmode" -eq 1 ]; then
     RESTORE_MODE="collections"
-    split_csv COLLECTIONS "$A2"
-    if [ "${#COLLECTIONS[@]}" -eq 0 ]; then
-      echo "Error: no collection names found in '$A2'."
+    if [ -z "${2:-}" ]; then
+      echo "Error: empty collection list. Pass a non-empty comma-separated list, or omit it to restore the whole DB."
       exit 1
     fi
-  elif [ -n "$A2" ] && [ -n "$A3" ] && [ -n "$A4" ] && [ -n "$A5" ]; then
+    split_csv COLLECTIONS "$2"
+    if [ "${#COLLECTIONS[@]}" -eq 0 ]; then
+      echo "Error: no collection names found in '$2'."
+      exit 1
+    fi
+  elif [ "$nmode" -eq 4 ]; then
     RESTORE_MODE="remap"
-    RESTORE_SOURCE_DB="$A2"
-    RESTORE_SOURCE_COLLECTION="$A3"
-    RESTORE_DEST_DB="$A4"
-    RESTORE_DEST_COLLECTION="$A5"
+    RESTORE_SOURCE_DB="$2"
+    RESTORE_SOURCE_COLLECTION="$3"
+    RESTORE_DEST_DB="$4"
+    RESTORE_DEST_COLLECTION="$5"
+    if [ -z "$RESTORE_SOURCE_DB" ] || [ -z "$RESTORE_SOURCE_COLLECTION" ] || [ -z "$RESTORE_DEST_DB" ] || [ -z "$RESTORE_DEST_COLLECTION" ]; then
+      echo "Error: remap arguments must all be non-empty: source_db source_collection dest_db dest_collection."
+      exit 1
+    fi
   else
-    echo "Error: restore takes either no extra args (whole DB), a single comma-separated"
-    echo "       collection list, or all four remap args: source_db source_collection dest_db dest_collection."
+    echo "Error: restore takes the backup file plus either nothing (whole DB), a single"
+    echo "       comma-separated collection list, or four remap args: source_db source_collection dest_db dest_collection."
     exit 1
   fi
 
@@ -443,7 +465,8 @@ case "$1" in
       exit 1
     fi
     health_check
-    backup "${2:-}"
+    shift
+    backup "$@"
     ;;
   list_backups_s3)
     if [ "$#" -gt 1 ]; then
@@ -468,7 +491,8 @@ case "$1" in
       exit 1
     fi
     health_check
-    restore "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
+    shift
+    restore "$@"
     ;;
   download_backup)
     if [ "$#" -gt 2 ]; then
