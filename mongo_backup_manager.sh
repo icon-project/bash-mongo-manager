@@ -86,6 +86,25 @@ build_mongo_auth_args() {
   fi
 }
 
+# Helper: split a comma-separated collection list into the named array, skipping
+# empty fields (so trailing/duplicate commas are tolerated). Uses read -ra so no
+# glob expansion happens — a collection name containing '*' is taken literally.
+# Names are not trimmed: a leading/trailing space is part of the name, so the
+# list must not contain spaces around the commas.
+split_csv() {
+  local -n _csv_out=$1
+  _csv_out=()
+  local IFS=',' _field
+  local -a _fields
+  read -ra _fields <<< "$2"
+  for _field in "${_fields[@]}"; do
+    if [ -n "$_field" ]; then _csv_out+=("$_field"); fi
+  done
+  # Always succeed: a trailing empty field would otherwise leave the loop's
+  # status at 1 (the failed test) and abort the caller under `set -e`.
+  return 0
+}
+
 # Helper: build mongosh auth args as an array. mongosh uses space-separated
 # flags (its CLI parser differs from mongodump/mongorestore which accept --flag=val).
 build_mongosh_auth_args() {
@@ -109,7 +128,22 @@ json_str() {
 }
 
 # Function to perform backup
+# Usage: backup [collections]
+# collections: optional comma-separated list of collections in MONGO_DB_NAME to
+# back up (e.g. "users,tasks"). When omitted, the whole database is dumped.
 backup() {
+  # An argument is present only if the caller actually passed one, so an
+  # explicitly empty selector (e.g. backup "" from an unset variable) is
+  # rejected rather than silently backing up the whole DB.
+  local COLLECTIONS_CSV=""
+  if [ "$#" -ge 1 ]; then
+    if [ -z "$1" ]; then
+      echo "Error: empty collection list. Pass a non-empty comma-separated list, or omit it to back up the whole DB."
+      exit 1
+    fi
+    COLLECTIONS_CSV="$1"
+  fi
+
   echo "Starting MongoDB backup at $TIMESTAMP..."
 
   mkdir -p "$BACKUP_DIR"
@@ -118,12 +152,97 @@ backup() {
   local AUTH_ARGS=()
   build_mongo_auth_args AUTH_ARGS
 
-  # Run the MongoDB dump command inside the container (NO sh -c; pass args directly)
-  docker exec "$CONTAINER_NAME" mongodump \
-    --archive="$BACKUP_FILE_NAME" \
-    --gzip \
-    "${AUTH_ARGS[@]}" \
-    --db="$MONGO_DB_NAME"
+  local DUMP_ARGS=( "--archive=$BACKUP_FILE_NAME" "--gzip" "${AUTH_ARGS[@]}" )
+  # Set to the collection name when we use --collection, so we can detect that
+  # mongodump reported the namespace missing (it exits 0 in that case).
+  local SINGLE_COLLECTION=""
+
+  if [ -n "$COLLECTIONS_CSV" ]; then
+    local -a COLLECTIONS
+    split_csv COLLECTIONS "$COLLECTIONS_CSV"
+    if [ "${#COLLECTIONS[@]}" -eq 0 ]; then
+      echo "Error: no collection names found in '$COLLECTIONS_CSV'."
+      exit 1
+    fi
+    echo "Backing up collections from ${MONGO_DB_NAME}: ${COLLECTIONS[*]}"
+
+    if [ "${#COLLECTIONS[@]}" -eq 1 ]; then
+      # A single collection is dumped directly with --collection, which needs no
+      # mongosh. mongodump exits 0 even when the collection is missing (it logs
+      # "does not exist"), so we validate via the dump output after running it.
+      DUMP_ARGS+=( "--db=$MONGO_DB_NAME" "--collection=${COLLECTIONS[0]}" )
+      SINGLE_COLLECTION="${COLLECTIONS[0]}"
+    else
+      # mongodump can't include multiple specific collections in one pass, so
+      # dump the whole DB minus everything not requested. Building that exclude
+      # list needs the full collection list, which we read with mongosh.
+      if ! docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
+        echo "Error: backing up more than one collection needs mongosh inside container '${CONTAINER_NAME}'."
+        echo "       Back them up one at a time, or use a container image that includes mongosh."
+        exit 1
+      fi
+
+      local MONGOSH_AUTH=()
+      if [ "$USE_CREDENTIALS" != "false" ]; then
+        MONGOSH_AUTH=( --username "$MONGO_USER" --password "$MONGO_PASSWORD" --authenticationDatabase admin )
+      fi
+      # JSON-escape the DB name into a JS string literal (see restore preflight).
+      local DB_ESC="${MONGO_DB_NAME//\\/\\\\}"
+      DB_ESC="${DB_ESC//\"/\\\"}"
+
+      local ALL_COLLECTIONS
+      ALL_COLLECTIONS=$(docker exec "$CONTAINER_NAME" mongosh --quiet "${MONGOSH_AUTH[@]}" \
+        --eval "db.getSiblingDB(\"${DB_ESC}\").getCollectionNames().forEach(function (n) { print(n); })")
+
+      # Warn about requested collections that don't exist.
+      local req
+      for req in "${COLLECTIONS[@]}"; do
+        if ! printf '%s\n' "$ALL_COLLECTIONS" | grep -qxF -- "$req"; then
+          echo "Warning: requested collection '$req' not found in ${MONGO_DB_NAME}; skipping."
+        fi
+      done
+
+      # Exclude every existing collection that wasn't requested.
+      DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
+      local kept=0 existing want
+      while IFS= read -r existing; do
+        [ -z "$existing" ] && continue
+        local keep=0
+        for want in "${COLLECTIONS[@]}"; do
+          if [ "$existing" = "$want" ]; then keep=1; break; fi
+        done
+        if [ "$keep" -eq 1 ]; then
+          kept=$((kept + 1))
+        else
+          DUMP_ARGS+=( "--excludeCollection=$existing" )
+        fi
+      done <<< "$ALL_COLLECTIONS"
+
+      if [ "$kept" -eq 0 ]; then
+        echo "Error: none of the requested collections exist in ${MONGO_DB_NAME}."
+        exit 1
+      fi
+    fi
+  else
+    DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
+  fi
+
+  # Run the MongoDB dump command inside the container (NO sh -c; pass args
+  # directly). Capture output so we can detect a missing single collection,
+  # which mongodump reports without a non-zero exit. Capture the exit status
+  # without letting set -e abort first, so the mongodump diagnostics are always
+  # printed before we exit on a real failure (bad creds, unreachable, disk full).
+  local DUMP_OUTPUT DUMP_STATUS=0
+  DUMP_OUTPUT=$(docker exec "$CONTAINER_NAME" mongodump "${DUMP_ARGS[@]}" 2>&1) || DUMP_STATUS=$?
+  printf '%s\n' "$DUMP_OUTPUT"
+  if [ "$DUMP_STATUS" -ne 0 ]; then
+    echo "Error: mongodump failed (exit $DUMP_STATUS); see output above."
+    exit 1
+  fi
+  if [ -n "$SINGLE_COLLECTION" ] && printf '%s\n' "$DUMP_OUTPUT" | grep -q "does not exist"; then
+    echo "Error: collection '${SINGLE_COLLECTION}' does not exist in ${MONGO_DB_NAME}; nothing was backed up."
+    exit 1
+  fi
 
   echo "MongoDB dump completed successfully."
 
@@ -162,9 +281,13 @@ list_backups_local() {
 }
 
 # Function to restore a given backup
-# Usage: restore <backup_file> [source_db] [source_collection] [dest_db] [dest_collection]
-# When all four namespace args are provided, restores that collection from the archive
-# (source_db.source_collection) into the destination namespace (dest_db.dest_collection).
+# Usage: restore <backup_file> [collections | source_db source_collection dest_db dest_collection]
+# - No extra args: restore the whole configured database.
+# - A single comma-separated list (e.g. "users,tasks"): restore only those
+#   collections from the archive into MONGO_DB_NAME.
+# - All four namespace args: restore that one collection from the archive
+#   (source_db.source_collection) into the destination namespace
+#   (dest_db.dest_collection).
 restore() {
   if [ -z "${1:-}" ]; then
     echo "Error: Please provide the backup file to restore."
@@ -172,27 +295,58 @@ restore() {
   fi
 
   local RESTORE_FILE=$1
-  local RESTORE_SOURCE_DB=${2:-}
-  local RESTORE_SOURCE_COLLECTION=${3:-}
-  local RESTORE_DEST_DB=${4:-}
-  local RESTORE_DEST_COLLECTION=${5:-}
+  # Mode is selected by the *count* of arguments after the file, which the caller
+  # preserves by forwarding the real args. This distinguishes "no selector" from
+  # an explicitly empty one (e.g. restore <file> "" from an unset variable): the
+  # latter is rejected rather than silently restoring/dropping the whole DB.
+  local nmode=$(( $# - 1 ))
 
   if [ ! -e "$RESTORE_FILE" ]; then
     echo "Error: Backup file $RESTORE_FILE not found in the host."
     exit 1
   fi
 
-  # Validate namespace remapping: all four must be set together or none
-  if [ -n "$RESTORE_SOURCE_DB" ] || [ -n "$RESTORE_SOURCE_COLLECTION" ] || [ -n "$RESTORE_DEST_DB" ] || [ -n "$RESTORE_DEST_COLLECTION" ]; then
-    if [ -z "$RESTORE_SOURCE_DB" ] || [ -z "$RESTORE_SOURCE_COLLECTION" ] || [ -z "$RESTORE_DEST_DB" ] || [ -z "$RESTORE_DEST_COLLECTION" ]; then
-      echo "Error: For namespace remapping you must specify all four: source_db source_collection dest_db dest_collection."
+  # Restore mode by argument count after the file:
+  #   0 args                                  -> restore the whole configured DB
+  #   1 arg  <collections>                    -> restore a comma-separated subset
+  #                                              of collections from MONGO_DB_NAME
+  #   4 args <src_db> <src_col> <dst_db> <dst_col> -> restore one collection,
+  #                                              remapping its namespace
+  local RESTORE_MODE
+  local RESTORE_SOURCE_DB="" RESTORE_SOURCE_COLLECTION="" RESTORE_DEST_DB="" RESTORE_DEST_COLLECTION=""
+  local -a COLLECTIONS=()
+  if [ "$nmode" -eq 0 ]; then
+    RESTORE_MODE="all"
+  elif [ "$nmode" -eq 1 ]; then
+    RESTORE_MODE="collections"
+    if [ -z "${2:-}" ]; then
+      echo "Error: empty collection list. Pass a non-empty comma-separated list, or omit it to restore the whole DB."
       exit 1
     fi
+    split_csv COLLECTIONS "$2"
+    if [ "${#COLLECTIONS[@]}" -eq 0 ]; then
+      echo "Error: no collection names found in '$2'."
+      exit 1
+    fi
+  elif [ "$nmode" -eq 4 ]; then
+    RESTORE_MODE="remap"
+    RESTORE_SOURCE_DB="$2"
+    RESTORE_SOURCE_COLLECTION="$3"
+    RESTORE_DEST_DB="$4"
+    RESTORE_DEST_COLLECTION="$5"
+    if [ -z "$RESTORE_SOURCE_DB" ] || [ -z "$RESTORE_SOURCE_COLLECTION" ] || [ -z "$RESTORE_DEST_DB" ] || [ -z "$RESTORE_DEST_COLLECTION" ]; then
+      echo "Error: remap arguments must all be non-empty: source_db source_collection dest_db dest_collection."
+      exit 1
+    fi
+  else
+    echo "Error: restore takes the backup file plus either nothing (whole DB), a single"
+    echo "       comma-separated collection list, or four remap args: source_db source_collection dest_db dest_collection."
+    exit 1
   fi
 
   # Determine the database the restore will write into.
   local TARGET_DB
-  if [ -n "$RESTORE_DEST_DB" ]; then
+  if [ "$RESTORE_MODE" = "remap" ]; then
     TARGET_DB="$RESTORE_DEST_DB"
   else
     TARGET_DB="$MONGO_DB_NAME"
@@ -240,22 +394,40 @@ restore() {
     "--drop"
   )
 
-  # If remapping, use nsInclude/nsFrom/nsTo (avoids deprecated --db/--collection behavior)
-  if [ -n "$RESTORE_SOURCE_DB" ]; then
-    local SRC_NS="${RESTORE_SOURCE_DB}.${RESTORE_SOURCE_COLLECTION}"
-    local DST_NS="${RESTORE_DEST_DB}.${RESTORE_DEST_COLLECTION}"
-    echo "Remapping namespace: $SRC_NS -> $DST_NS"
-    echo "Note: MongoDB user must have readWrite on destination database '${RESTORE_DEST_DB}'."
-
-    RESTORE_ARGS+=(
-      "--nsInclude=$SRC_NS"
-      "--nsFrom=$SRC_NS"
-      "--nsTo=$DST_NS"
-    )
-  else
-    # Default behavior: restore only the configured DB
-    RESTORE_ARGS+=("--nsInclude=${MONGO_DB_NAME}.*")
-  fi
+  case "$RESTORE_MODE" in
+    remap)
+      # Restore one collection, remapping its namespace via nsInclude/nsFrom/nsTo
+      # (avoids deprecated --db/--collection behavior).
+      local SRC_NS="${RESTORE_SOURCE_DB}.${RESTORE_SOURCE_COLLECTION}"
+      local DST_NS="${RESTORE_DEST_DB}.${RESTORE_DEST_COLLECTION}"
+      echo "Remapping namespace: $SRC_NS -> $DST_NS"
+      echo "Note: MongoDB user must have readWrite on destination database '${RESTORE_DEST_DB}'."
+      RESTORE_ARGS+=(
+        "--nsInclude=$SRC_NS"
+        "--nsFrom=$SRC_NS"
+        "--nsTo=$DST_NS"
+      )
+      ;;
+    collections)
+      # Restore only the named collections from the configured DB (one
+      # --nsInclude each). --drop only drops the collections being restored.
+      echo "Restoring collections into ${MONGO_DB_NAME}: ${COLLECTIONS[*]}"
+      local col col_esc
+      for col in "${COLLECTIONS[@]}"; do
+        # --nsInclude is a namespace *pattern* where '*' is a wildcard and '\'
+        # escapes it. Escape '\' then '*' in the collection name so a name like
+        # 'foo*' matches only itself, not 'foo1'/'foobar'. (DB names can't
+        # contain these characters, so only the collection part needs escaping.)
+        col_esc="${col//\\/\\\\}"
+        col_esc="${col_esc//\*/\\*}"
+        RESTORE_ARGS+=( "--nsInclude=${MONGO_DB_NAME}.${col_esc}" )
+      done
+      ;;
+    *)
+      # Default behavior: restore only the configured DB
+      RESTORE_ARGS+=( "--nsInclude=${MONGO_DB_NAME}.*" )
+      ;;
+  esac
 
   docker exec "$CONTAINER_NAME" mongorestore \
     "${AUTH_ARGS[@]}" \
@@ -418,9 +590,11 @@ help() {
   echo "Usage: ./mongo_backup_manager.sh [command] [options]"
   echo
   echo "Commands:"
-  echo "  backup                 Perform a MongoDB backup and upload it to S3."
-  echo "  restore [file] [source_db] [source_collection] [dest_db] [dest_collection]"
-  echo "                         Restore a MongoDB backup. Optionally remap a namespace (all four required)."
+  echo "  backup [collections]   Perform a MongoDB backup and upload it to S3."
+  echo "                         Optionally pass a comma-separated collection list to back up a subset."
+  echo "  restore [file] [collections | source_db source_collection dest_db dest_collection]"
+  echo "                         Restore a MongoDB backup. With a comma-separated collection list,"
+  echo "                         restore only those collections; with all four namespace args, remap one."
   echo "  verify [source_db] [source_collection] [dest_db] [dest_collection]"
   echo "                         Compare counts and full index specs between two namespaces; exits non-zero on mismatch."
   echo "  list_backups_s3        List all backups available in the S3 bucket."
@@ -434,7 +608,9 @@ help() {
   echo
   echo "Examples:"
   echo "  ./mongo_backup_manager.sh backup"
+  echo "  ./mongo_backup_manager.sh backup users,tasks"
   echo "  ./mongo_backup_manager.sh restore ./backups/mongo_backup_2026-02-09_08-56-18.gz"
+  echo "  ./mongo_backup_manager.sh restore ./backups/mongo_backup_2026-02-09_08-56-18.gz users,tasks"
   echo "  ./mongo_backup_manager.sh restore ./backups/mongo_backup_2026-02-09_08-56-18.gz sodax-registration users new-world stateful_users"
   echo "  ./mongo_backup_manager.sh verify sodax-registration users new-world stateful_users"
 }
@@ -448,26 +624,52 @@ fi
 # Main logic to parse arguments and call the corresponding function
 case "$1" in
   backup)
+    # At most one extra arg (the collection list). Reject extras so a list
+    # mistyped with spaces (e.g. "users, tasks") fails fast instead of silently
+    # backing up only the first collection.
+    if [ "$#" -gt 2 ]; then
+      echo "Error: too many arguments for backup. Pass at most one comma-separated collection list with no spaces (e.g. users,tasks)."
+      exit 1
+    fi
     health_check
-    backup
+    shift
+    backup "$@"
     ;;
   list_backups_s3)
+    if [ "$#" -gt 1 ]; then
+      echo "Error: list_backups_s3 takes no arguments."
+      exit 1
+    fi
     health_check
     list_backups_s3
     ;;
   list_backups_local)
+    if [ "$#" -gt 1 ]; then
+      echo "Error: list_backups_local takes no arguments."
+      exit 1
+    fi
     health_check
     list_backups_local
     ;;
   restore)
+    # restore <file> plus at most four mode args (collection list, or remap).
+    if [ "$#" -gt 6 ]; then
+      echo "Error: too many arguments for restore. Pass a comma-separated collection list with no spaces, or the four remap args."
+      exit 1
+    fi
     health_check
-    restore "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
+    shift
+    restore "$@"
     ;;
   verify)
     health_check
     verify "${2:-}" "${3:-}" "${4:-}" "${5:-}"
     ;;
   download_backup)
+    if [ "$#" -gt 2 ]; then
+      echo "Error: too many arguments for download_backup. Pass a single backup file name."
+      exit 1
+    fi
     health_check
     download_backup "${2:-}"
     ;;

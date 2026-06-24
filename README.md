@@ -5,7 +5,7 @@ This script automates the process of backing up a MongoDB database running in a 
 ---
 
 ## Features
-- Creates compressed backups of your MongoDB database using `mongodump`.
+- Creates compressed backups of your MongoDB database using `mongodump`, optionally limited to a subset of collections.
 - Stores backups locally in a specified directory.
 - Uploads backups to an AWS S3 bucket.
 - Automatically cleans up old backups from the local directory (optional).
@@ -120,6 +120,12 @@ The `backup` command can be used to create a backup of the MongoDB database:
 ./mongo_backup_manager.sh backup
 ```
 
+To back up only a subset of collections, pass a comma-separated list (no spaces around the commas):
+```bash
+./mongo_backup_manager.sh backup users,tasks
+```
+A **single** collection is dumped directly with `mongodump --collection` and needs no `mongosh`; if the name is misspelled the script detects mongodump's "does not exist" report and errors instead of writing an empty archive. Backing up **more than one** collection requires `mongosh` inside the container — `mongodump` can't include multiple specific collections in one pass, so the script enumerates the database's collections and dumps the whole database minus everything you didn't request (names not present are skipped with a warning, and it errors if none of the requested collections exist).
+
 The `list_backups_local` command can be used to list all backups stored locally:
 ```bash
 ./mongo_backup_manager.sh list_backups_local
@@ -167,6 +173,12 @@ The following command showcases how to restore a backup:
 ```bash
 ./mongo_backup_manager.sh restore backups_temp/mongo_backup_2024-11-20_13-28-59.gz
 ```
+
+To restore only a subset of collections (into `MONGO_DB_NAME`), pass a comma-separated list (no spaces around the commas) as the single extra argument:
+```bash
+./mongo_backup_manager.sh restore backups_temp/mongo_backup_2024-11-20_13-28-59.gz users,tasks
+```
+Only the listed collections are restored from the archive (via `mongorestore --nsInclude`); `--drop` only affects the collections being restored, so the rest of the database is left untouched. A single name (e.g. `users`) restores just that one collection in place.
 
 You can optionally remap a namespace by specifying source database and collection, then destination database and collection (all four arguments are required together):
 ```bash
