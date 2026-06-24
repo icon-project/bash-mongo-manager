@@ -98,8 +98,11 @@ split_csv() {
   local -a _fields
   read -ra _fields <<< "$2"
   for _field in "${_fields[@]}"; do
-    [ -n "$_field" ] && _csv_out+=("$_field")
+    if [ -n "$_field" ]; then _csv_out+=("$_field"); fi
   done
+  # Always succeed: a trailing empty field would otherwise leave the loop's
+  # status at 1 (the failed test) and abort the caller under `set -e`.
+  return 0
 }
 
 # Helper: build mongosh auth args as an array. mongosh uses space-separated
