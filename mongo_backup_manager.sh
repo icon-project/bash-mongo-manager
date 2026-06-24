@@ -21,36 +21,23 @@ mkdir -p "$(dirname "$LOG_FILE")"
 ENV_FILE="${SCRIPT_DIR}/.env"
 if [ -f "$ENV_FILE" ]; then
   set -a
+  # Source with carriage returns stripped so a .env saved with Windows (CRLF)
+  # line endings can't break us. Stripping at source time (not after) is what
+  # matters: a blank CRLF line would otherwise make bash try to run $'\r' as a
+  # command and abort under `set -e`, and values would carry a trailing "\r"
+  # that silently breaks docker exec, auth, and the S3 path. Removing only CR
+  # never touches meaningful whitespace inside a value (e.g. a password).
   # shellcheck disable=SC1090
-  source "$ENV_FILE"
+  source <(tr -d '\r' < "$ENV_FILE")
   set +a
 else
   echo "Error: The .env file is missing. Please create the .env file with the required environment variables."
   exit 1
 fi
 
-# Strip ONLY Windows CR characters from a value. A .env saved with CRLF line
-# endings otherwise leaves a trailing "\r" on every sourced variable, which
-# silently breaks docker exec (container "not found"), auth, and the S3 path.
-# We strip only CR on purpose — never trim other whitespace, which could corrupt
-# a legitimate password.
-strip_cr() {
-  local s="${1-}"
-  printf '%s' "${s//$'\r'/}"
-}
-
-# Normalize feature flags with defaults (and strip any CR from CRLF .env files)
-USE_CREDENTIALS=$(strip_cr "$(echo "${USE_CREDENTIALS:-true}" | tr '[:upper:]' '[:lower:]')")
-USE_REMOTE=$(strip_cr "$(echo "${USE_REMOTE:-true}" | tr '[:upper:]' '[:lower:]')")
-
-# Sanitize the remaining variables sourced from .env (CR only)
-CONTAINER_NAME=$(strip_cr "${CONTAINER_NAME:-}")
-MONGO_PORT=$(strip_cr "${MONGO_PORT:-}")
-MONGO_DB_NAME=$(strip_cr "${MONGO_DB_NAME:-}")
-MONGO_USER=$(strip_cr "${MONGO_USER:-}")
-MONGO_PASSWORD=$(strip_cr "${MONGO_PASSWORD:-}")
-S3_BUCKET_NAME=$(strip_cr "${S3_BUCKET_NAME:-}")
-AWS_PROFILE=$(strip_cr "${AWS_PROFILE:-}")
+# Normalize feature flags with defaults
+USE_CREDENTIALS=$(echo "${USE_CREDENTIALS:-true}" | tr '[:upper:]' '[:lower:]')
+USE_REMOTE=$(echo "${USE_REMOTE:-true}" | tr '[:upper:]' '[:lower:]')
 
 # Function to check if the required environment variables are set correctly
 health_check() {
