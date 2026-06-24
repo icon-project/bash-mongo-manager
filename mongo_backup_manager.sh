@@ -102,6 +102,28 @@ split_csv() {
   done
 }
 
+# Helper: build mongosh auth args as an array. mongosh uses space-separated
+# flags (its CLI parser differs from mongodump/mongorestore which accept --flag=val).
+build_mongosh_auth_args() {
+  local -n _out=$1
+  _out=()
+  if [ "$USE_CREDENTIALS" != "false" ]; then
+    _out+=( "--username" "$MONGO_USER" "--password" "$MONGO_PASSWORD" "--authenticationDatabase" "admin" )
+  fi
+}
+
+# Helper: emit a value as a JSON/JS string literal (quoted, with backslashes and
+# double quotes escaped). Used so a db/collection name containing a quote or
+# backslash can't break or alter the JS we hand to mongosh. Order matters:
+# escape backslashes before quotes. (Mongo namespaces can't contain control
+# characters, so escaping \ and " is sufficient.)
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '"%s"' "$s"
+}
+
 # Function to perform backup
 # Usage: backup [collections]
 # collections: optional comma-separated list of collections in MONGO_DB_NAME to
@@ -416,6 +438,122 @@ restore() {
   echo "Restore completed successfully."
 }
 
+# Function to verify count + full index-spec parity between a source and a
+# (restored) target namespace, both reachable from CONTAINER_NAME's mongod.
+# Usage: verify <src_db> <src_col> <dst_db> <dst_col>
+# Exits non-zero if document counts differ or any index spec differs.
+# Index comparison strips the cosmetic `v` and `ns` fields (ns legitimately
+# differs across DBs) and compares the full remaining spec: name, key,
+# unique, sparse, partialFilterExpression, collation, TTL (expireAfterSeconds).
+verify() {
+  if [ -z "${1:-}" ] || [ -z "${2:-}" ] || [ -z "${3:-}" ] || [ -z "${4:-}" ]; then
+    echo "Error: verify requires all four arguments: <src_db> <src_col> <dst_db> <dst_col>."
+    exit 1
+  fi
+
+  local SRC_DB=$1
+  local SRC_COL=$2
+  local DST_DB=$3
+  local DST_COL=$4
+
+  echo "Verifying ${SRC_DB}.${SRC_COL} -> ${DST_DB}.${DST_COL}..."
+
+  local AUTH_ARGS=()
+  build_mongosh_auth_args AUTH_ARGS
+
+  # JSON-encode the four names into JS string literals so that names containing
+  # quotes or backslashes can't break or alter the script (JSON strings are
+  # valid JS string literals). The prelude is assembled separately and prepended
+  # to the logic body, which lives in a *quoted* heredoc — no shell expansion,
+  # so the JS may use '$'/backticks freely and the names are never re-expanded.
+  local SRC_DB_JS SRC_COL_JS DST_DB_JS DST_COL_JS
+  SRC_DB_JS=$(json_str "$SRC_DB")
+  SRC_COL_JS=$(json_str "$SRC_COL")
+  DST_DB_JS=$(json_str "$DST_DB")
+  DST_COL_JS=$(json_str "$DST_COL")
+
+  # The eval script runs inside the container's mongosh. Both namespaces are
+  # reached via getSiblingDB on the same connection. It prints a summary and
+  # quit()s non-zero on any mismatch.
+  local JS_BODY
+  JS_BODY=$(cat <<'EOF'
+
+// Canonical stringify: sort object keys recursively so field order never
+// produces false mismatches. The index "key" field is order-sensitive
+// (compound indexes), so preserve its insertion order. Only *plain* objects
+// are recursed into; BSON scalar wrappers (Date, ObjectId, Long, Decimal128,
+// etc.) carry their value in a non-enumerable form and would collapse to "{}"
+// if recursed, so serialize them with EJSON (falling back to JSON) to keep
+// distinct values distinct in e.g. a partialFilterExpression Date threshold.
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v)
+    && Object.getPrototypeOf(v) === Object.prototype;
+}
+function rawKey(o) {
+  return "{" + Object.keys(o).map(function (k) {
+    return JSON.stringify(k) + ":" + canon(o[k]);
+  }).join(",") + "}";
+}
+function canon(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+  if (isPlainObject(v)) {
+    return "{" + Object.keys(v).sort().map(function (k) {
+      return JSON.stringify(k) + ":" + (k === "key" ? rawKey(v[k]) : canon(v[k]));
+    }).join(",") + "}";
+  }
+  return (typeof EJSON !== "undefined") ? EJSON.stringify(v) : JSON.stringify(v);
+}
+function normIndexes(idxs) {
+  return idxs.map(function (i) {
+    const c = {};
+    Object.keys(i).forEach(function (k) { if (k !== "v" && k !== "ns") c[k] = i[k]; });
+    return c;
+  }).map(canon).sort();
+}
+
+const srcCount = srcDb.getCollection(srcCol).countDocuments({});
+const dstCount = dstDb.getCollection(dstCol).countDocuments({});
+const srcIdx = normIndexes(srcDb.getCollection(srcCol).getIndexes());
+const dstIdx = normIndexes(dstDb.getCollection(dstCol).getIndexes());
+
+const problems = [];
+if (srcCount !== dstCount) {
+  problems.push("count mismatch: source=" + srcCount + " target=" + dstCount);
+}
+const dstSet = new Set(dstIdx);
+const srcSet = new Set(srcIdx);
+srcIdx.forEach(function (s) { if (!dstSet.has(s)) problems.push("index on source missing/differs on target: " + s); });
+dstIdx.forEach(function (d) { if (!srcSet.has(d)) problems.push("index on target absent/differs on source: " + d); });
+
+print("source " + srcDb.getName() + "." + srcCol + ": count=" + srcCount + " indexes=" + srcIdx.length);
+print("target " + dstDb.getName() + "." + dstCol + ": count=" + dstCount + " indexes=" + dstIdx.length);
+
+if (problems.length) {
+  print("VERIFY FAILED:");
+  problems.forEach(function (p) { print("  - " + p); });
+  quit(1);
+}
+print("VERIFY OK: document counts and full index specs match.");
+quit(0);
+EOF
+)
+
+  # Prepend the namespace bindings (JSON literals) to the logic body.
+  local JS="const srcDb = db.getSiblingDB(${SRC_DB_JS});
+const dstDb = db.getSiblingDB(${DST_DB_JS});
+const srcCol = ${SRC_COL_JS};
+const dstCol = ${DST_COL_JS};
+${JS_BODY}"
+
+  if docker exec "$CONTAINER_NAME" mongosh --quiet "${AUTH_ARGS[@]}" --eval "$JS"; then
+    echo "Verification passed."
+  else
+    echo "Verification failed."
+    exit 1
+  fi
+}
+
 # Function to download a backup from S3 and put it in the S3_BACKUP_DIR_TEMP
 download_backup() {
   if [ -z "${1:-}" ]; then
@@ -454,6 +592,8 @@ help() {
   echo "  restore [file] [collections | source_db source_collection dest_db dest_collection]"
   echo "                         Restore a MongoDB backup. With a comma-separated collection list,"
   echo "                         restore only those collections; with all four namespace args, remap one."
+  echo "  verify [source_db] [source_collection] [dest_db] [dest_collection]"
+  echo "                         Compare counts and full index specs between two namespaces; exits non-zero on mismatch."
   echo "  list_backups_s3        List all backups available in the S3 bucket."
   echo "  list_backups_local     List all backups in the local backup directory."
   echo "  download_backup [file] Download a backup from S3 and store it locally."
@@ -469,6 +609,7 @@ help() {
   echo "  ./mongo_backup_manager.sh restore ./backups/mongo_backup_2026-02-09_08-56-18.gz"
   echo "  ./mongo_backup_manager.sh restore ./backups/mongo_backup_2026-02-09_08-56-18.gz users,tasks"
   echo "  ./mongo_backup_manager.sh restore ./backups/mongo_backup_2026-02-09_08-56-18.gz sodax-registration users new-world stateful_users"
+  echo "  ./mongo_backup_manager.sh verify sodax-registration users new-world stateful_users"
 }
 
 # Call the help function if the script is run without arguments or with the 'help' command
@@ -517,6 +658,10 @@ case "$1" in
     shift
     restore "$@"
     ;;
+  verify)
+    health_check
+    verify "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+    ;;
   download_backup)
     if [ "$#" -gt 2 ]; then
       echo "Error: too many arguments for download_backup. Pass a single backup file name."
@@ -529,7 +674,7 @@ case "$1" in
     help
     ;;
   *)
-    echo "Usage: $0 {backup|restore|list_backups_s3|list_backups_local|download_backup|help} [args]"
+    echo "Usage: $0 {backup|restore|verify|list_backups_s3|list_backups_local|download_backup|help} [args]"
     exit 1
     ;;
 esac
