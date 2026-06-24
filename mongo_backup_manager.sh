@@ -204,11 +204,16 @@ backup() {
 
   # Run the MongoDB dump command inside the container (NO sh -c; pass args
   # directly). Capture output so we can detect a missing single collection,
-  # which mongodump reports without a non-zero exit. (local on its own line so
-  # the assignment's exit status still triggers set -e on a real dump failure.)
-  local DUMP_OUTPUT
-  DUMP_OUTPUT=$(docker exec "$CONTAINER_NAME" mongodump "${DUMP_ARGS[@]}" 2>&1)
+  # which mongodump reports without a non-zero exit. Capture the exit status
+  # without letting set -e abort first, so the mongodump diagnostics are always
+  # printed before we exit on a real failure (bad creds, unreachable, disk full).
+  local DUMP_OUTPUT DUMP_STATUS=0
+  DUMP_OUTPUT=$(docker exec "$CONTAINER_NAME" mongodump "${DUMP_ARGS[@]}" 2>&1) || DUMP_STATUS=$?
   printf '%s\n' "$DUMP_OUTPUT"
+  if [ "$DUMP_STATUS" -ne 0 ]; then
+    echo "Error: mongodump failed (exit $DUMP_STATUS); see output above."
+    exit 1
+  fi
   if [ -n "$SINGLE_COLLECTION" ] && printf '%s\n' "$DUMP_OUTPUT" | grep -q "does not exist"; then
     echo "Error: collection '${SINGLE_COLLECTION}' does not exist in ${MONGO_DB_NAME}; nothing was backed up."
     exit 1
