@@ -435,22 +435,46 @@ fi
 # Main logic to parse arguments and call the corresponding function
 case "$1" in
   backup)
+    # At most one extra arg (the collection list). Reject extras so a list
+    # mistyped with spaces (e.g. "users, tasks") fails fast instead of silently
+    # backing up only the first collection.
+    if [ "$#" -gt 2 ]; then
+      echo "Error: too many arguments for backup. Pass at most one comma-separated collection list with no spaces (e.g. users,tasks)."
+      exit 1
+    fi
     health_check
     backup "${2:-}"
     ;;
   list_backups_s3)
+    if [ "$#" -gt 1 ]; then
+      echo "Error: list_backups_s3 takes no arguments."
+      exit 1
+    fi
     health_check
     list_backups_s3
     ;;
   list_backups_local)
+    if [ "$#" -gt 1 ]; then
+      echo "Error: list_backups_local takes no arguments."
+      exit 1
+    fi
     health_check
     list_backups_local
     ;;
   restore)
+    # restore <file> plus at most four mode args (collection list, or remap).
+    if [ "$#" -gt 6 ]; then
+      echo "Error: too many arguments for restore. Pass a comma-separated collection list with no spaces, or the four remap args."
+      exit 1
+    fi
     health_check
     restore "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"
     ;;
   download_backup)
+    if [ "$#" -gt 2 ]; then
+      echo "Error: too many arguments for download_backup. Pass a single backup file name."
+      exit 1
+    fi
     health_check
     download_backup "${2:-}"
     ;;
