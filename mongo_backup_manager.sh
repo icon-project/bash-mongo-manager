@@ -377,22 +377,29 @@ restore() {
   # latter is rejected rather than silently restoring/dropping the whole DB.
   local nmode=$(( $# - 1 ))
 
-  # Resolve the backup path independently of the caller's CWD. An absolute path,
-  # or one that exists relative to CWD, is used as-is; otherwise we look for it
-  # (by the given path and by basename) under the script's own backup dirs. This
-  # lets a `download_backup` result be restored from anywhere — the dirs are
-  # SCRIPT_DIR-anchored, but under cron/systemd CWD is usually $HOME, so
-  # `restore backups_temp/foo.gz` would otherwise not be found.
+  # Resolve the backup path independently of the caller's CWD, without ever
+  # letting a typo silently select a *different* archive — mongorestore --drop
+  # below would otherwise overwrite the target with the wrong data:
+  #   * an existing path (absolute, or relative to CWD) is used as-is;
+  #   * an absolute path that doesn't exist fails fast — no fallback;
+  #   * a relative path with a directory part is re-anchored at SCRIPT_DIR,
+  #     preserving its structure, so `restore backups_temp/foo.gz` works from any
+  #     CWD (e.g. under cron/systemd where CWD is $HOME);
+  #   * a bare filename is looked up in the script's own backup dirs — the form
+  #     `download_backup` prints.
   if [ ! -e "$RESTORE_FILE" ]; then
     local cand
-    for cand in "${S3_BACKUP_DIR_TEMP}/${RESTORE_FILE}" "${BACKUP_DIR}/${RESTORE_FILE}" \
-                "${S3_BACKUP_DIR_TEMP}/$(basename "$RESTORE_FILE")" "${BACKUP_DIR}/$(basename "$RESTORE_FILE")"; do
-      if [ -e "$cand" ]; then RESTORE_FILE=$cand; break; fi
-    done
+    case "$RESTORE_FILE" in
+      /*) : ;;                                             # absolute + missing -> fail fast
+      */*) [ -e "${SCRIPT_DIR}/${RESTORE_FILE}" ] && RESTORE_FILE="${SCRIPT_DIR}/${RESTORE_FILE}" ;;
+      *)  for cand in "${S3_BACKUP_DIR_TEMP}/${RESTORE_FILE}" "${BACKUP_DIR}/${RESTORE_FILE}"; do
+            if [ -e "$cand" ]; then RESTORE_FILE=$cand; break; fi
+          done ;;
+    esac
   fi
 
   if [ ! -e "$RESTORE_FILE" ]; then
-    echo "Error: Backup file '$1' not found (looked relative to CWD, and in $S3_BACKUP_DIR_TEMP and $BACKUP_DIR)."
+    echo "Error: Backup file '$1' not found (looked relative to CWD; for a bare name, also in $S3_BACKUP_DIR_TEMP and $BACKUP_DIR)."
     exit 1
   fi
 
