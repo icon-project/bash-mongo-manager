@@ -1,5 +1,21 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
+
+# This script needs bash 4.3+: it uses namerefs (local -n) and loads .env via
+# `source <(...)` process substitution. macOS ships bash 3.2 as /bin/bash, where
+# BOTH break — the nameref syntax errors and, worse, the process-substitution
+# source silently reads *nothing*, so every var falls back to its default. That
+# turns USE_REMOTE into "true" and the run dies later with a baffling
+# "S3_BUCKET_NAME: unbound variable". Fail fast here with an actionable message
+# instead. (The guard itself uses only 3.2-safe syntax.)
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] || \
+   { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 3 ]; }; then
+  echo "Error: this script requires bash 4.3 or newer (found ${BASH_VERSION:-non-bash shell})." >&2
+  echo "       macOS ships bash 3.2 as /bin/bash. Install a newer bash and run under it:" >&2
+  echo "         brew install bash                 # puts bash 5.x first on PATH" >&2
+  echo "         ./mongo_backup_manager.sh ...     # uses #!/usr/bin/env bash" >&2
+  exit 1
+fi
 
 # Get the current directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -10,12 +26,29 @@ LOG_FILE="${SCRIPT_DIR}/logs/mongo_backup_manager.log"
 # Ensure logs dir exists
 mkdir -p "$(dirname "$LOG_FILE")"
 
+# Mirror everything this run prints (stdout + stderr) into the log while still
+# showing it on the terminal / journal. Previously only the run separators were
+# written here, so the "log" recorded timestamps but none of the actual output;
+# tee makes it a real record however the script is invoked. Using a process
+# substitution (not a `| tee` pipe) keeps the script's own exit status intact.
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# Always close the run out with an end separator and the exit code — even on an
+# early exit or a failure under `set -e`. The trap fires on every exit path; the
+# old end-of-file block was skipped whenever the script exited early, so a failed
+# run looked like it never finished.
+log_run_end() {
+  local ec=$?
+  echo "-----------------------------------"
+  echo "Run ended at $(date '+%Y-%m-%d %H:%M:%S') (exit $ec)"
+  echo "-----------------------------------"
+}
+trap log_run_end EXIT
+
 # Add a separator for each run
-{
-  echo "==================================="
-  echo "Run started at $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "==================================="
-} >> "$LOG_FILE"
+echo "==================================="
+echo "Run started at $(date '+%Y-%m-%d %H:%M:%S')"
+echo "==================================="
 
 # Load environment variables from .env file
 ENV_FILE="${SCRIPT_DIR}/.env"
@@ -69,8 +102,13 @@ health_check() {
 
 # Set the rest of the variables
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
-BACKUP_DIR="./backups"
-S3_BACKUP_DIR_TEMP="./backups_temp"
+# Anchor the backup dirs to the script's own location (like LOG_FILE / ENV_FILE
+# above), not the caller's CWD. A relative "./backups" would otherwise land
+# wherever the process was started from — e.g. $HOME under cron/systemd — silently
+# splitting dumps from the logs and pruning the wrong directory. SCRIPT_DIR is
+# absolute, so backups always live beside the script no matter who invokes it.
+BACKUP_DIR="${SCRIPT_DIR}/backups"
+S3_BACKUP_DIR_TEMP="${SCRIPT_DIR}/backups_temp"
 BACKUP_FILE_NAME="mongo_backup_${TIMESTAMP}.gz"
 BACKUP_FILE="${BACKUP_DIR}/${BACKUP_FILE_NAME}"
 if [ "$USE_REMOTE" != "false" ]; then
@@ -249,10 +287,48 @@ backup() {
   # Copy the backup from the container to the host
   docker cp "$CONTAINER_NAME:$BACKUP_FILE_NAME" "$BACKUP_FILE"
 
+  # Remove the in-container archive now that it's safely on the host. mongodump
+  # wrote it to the container's working directory and nothing else cleans it up,
+  # so without this every run would leave another dump inside the container and
+  # grow its writable layer without bound. Mirrors the /tmp cleanup in restore.
+  docker exec "$CONTAINER_NAME" rm -f "$BACKUP_FILE_NAME" || true
+
   # Upload the backup to S3
   if [ "$USE_REMOTE" != "false" ]; then
     aws s3 cp "$BACKUP_FILE" "$S3_BACKUP_PATH" --profile "$AWS_PROFILE"
     echo "Backup uploaded to S3 successfully."
+
+    # Prune S3 backups older than 7 days (mirrors the local find -mtime +7 below).
+    # S3 has no server-side age filter, so list the keys under the prefix and
+    # compare the timestamp embedded in each backup's name against a cutoff built
+    # the same way the names are (host-local time, like TIMESTAMP above). The name
+    # layout mongo_backup_YYYY-MM-DD_HH-MM-SS.gz sorts lexicographically, so a plain
+    # string "<" is a valid time comparison — no per-object date parsing needed.
+    # `date +%s` is portable; formatting an epoch back differs by platform, so try
+    # BSD's `-r` (macOS) first, then fall back to GNU's `-d @` (Linux). This is
+    # best-effort: the dump already uploaded, so a transient S3 error warns rather
+    # than failing the run. Needs s3:ListBucket + s3:DeleteObject (see README).
+    local cutoff_epoch cutoff_ts s3_keys s3_key s3_name s3_ts
+    cutoff_epoch=$(( $(date +%s) - 7 * 86400 ))
+    cutoff_ts=$(date -r "$cutoff_epoch" +%Y-%m-%d_%H-%M-%S 2>/dev/null \
+             || date -d "@$cutoff_epoch" +%Y-%m-%d_%H-%M-%S)
+    if s3_keys=$(aws s3api list-objects-v2 \
+                   --bucket "$S3_BUCKET_NAME" --prefix "mongodb-backups/" \
+                   --query 'Contents[].Key' --output text --profile "$AWS_PROFILE"); then
+      while IFS= read -r s3_key; do
+        [ -n "$s3_key" ] && [ "$s3_key" != "None" ] || continue
+        s3_name=${s3_key##*/}
+        case "$s3_name" in mongo_backup_*.gz) ;; *) continue ;; esac
+        s3_ts=${s3_name#mongo_backup_}; s3_ts=${s3_ts%.gz}
+        if [[ "$s3_ts" < "$cutoff_ts" ]]; then
+          echo "Deleting old S3 backup: $s3_key"
+          aws s3 rm "s3://${S3_BUCKET_NAME}/${s3_key}" --profile "$AWS_PROFILE" \
+            || echo "Warning: failed to delete s3://${S3_BUCKET_NAME}/${s3_key}" >&2
+        fi
+      done <<< "$(printf '%s' "$s3_keys" | tr '\t' '\n')"
+    else
+      echo "Warning: could not list S3 objects for retention; skipping remote prune." >&2
+    fi
   else
     echo "Skipping S3 upload because USE_REMOTE=false."
   fi
@@ -681,9 +757,3 @@ case "$1" in
     exit 1
     ;;
 esac
-
-{
-  echo "-----------------------------------"
-  echo "Run ended at $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "-----------------------------------"
-} >> "$LOG_FILE"
