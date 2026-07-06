@@ -302,16 +302,19 @@ backup() {
     # S3 has no server-side age filter, so list the keys under the prefix and
     # compare the timestamp embedded in each backup's name against a cutoff built
     # the same way the names are (host-local time, like TIMESTAMP above). The name
-    # layout mongo_backup_YYYY-MM-DD_HH-MM-SS.gz sorts lexicographically, so a plain
-    # string "<" is a valid time comparison — no per-object date parsing needed.
+    # layout mongo_backup_YYYY-MM-DD_HH-MM-SS.gz reduces to a fixed-width 14-digit
+    # number once punctuation is stripped, so compare those as integers — a string
+    # "<" would be locale-dependent (a non-C LC_COLLATE could reorder them and
+    # prune the wrong keys), while an integer compare is deterministic.
     # `date +%s` is portable; formatting an epoch back differs by platform, so try
     # BSD's `-r` (macOS) first, then fall back to GNU's `-d @` (Linux). This is
     # best-effort: the dump already uploaded, so a transient S3 error warns rather
     # than failing the run. Needs s3:ListBucket + s3:DeleteObject (see README).
-    local cutoff_epoch cutoff_ts s3_keys s3_key s3_name s3_ts
+    local cutoff_epoch cutoff_ts cutoff_digits s3_keys s3_key s3_name s3_ts s3_digits
     cutoff_epoch=$(( $(date +%s) - 7 * 86400 ))
     cutoff_ts=$(date -r "$cutoff_epoch" +%Y-%m-%d_%H-%M-%S 2>/dev/null \
              || date -d "@$cutoff_epoch" +%Y-%m-%d_%H-%M-%S)
+    cutoff_digits=${cutoff_ts//[^0-9]/}
     if s3_keys=$(aws s3api list-objects-v2 \
                    --bucket "$S3_BUCKET_NAME" --prefix "mongodb-backups/" \
                    --query 'Contents[].Key' --output text --profile "$AWS_PROFILE"); then
@@ -320,7 +323,9 @@ backup() {
         s3_name=${s3_key##*/}
         case "$s3_name" in mongo_backup_*.gz) ;; *) continue ;; esac
         s3_ts=${s3_name#mongo_backup_}; s3_ts=${s3_ts%.gz}
-        if [[ "$s3_ts" < "$cutoff_ts" ]]; then
+        s3_digits=${s3_ts//[^0-9]/}
+        [ -n "$s3_digits" ] || continue   # skip names without a parseable timestamp
+        if [ "$s3_digits" -lt "$cutoff_digits" ]; then
           echo "Deleting old S3 backup: $s3_key"
           aws s3 rm "s3://${S3_BUCKET_NAME}/${s3_key}" --profile "$AWS_PROFILE" \
             || echo "Warning: failed to delete s3://${S3_BUCKET_NAME}/${s3_key}" >&2
