@@ -4,9 +4,9 @@ set -euo pipefail
 # This script needs bash 4.3+: it uses namerefs (local -n) and loads .env via
 # `source <(...)` process substitution. macOS ships bash 3.2 as /bin/bash, where
 # BOTH break — the nameref syntax errors and, worse, the process-substitution
-# source silently reads *nothing*, so every var falls back to its default. That
-# turns USE_REMOTE into "true" and the run dies later with a baffling
-# "S3_BUCKET_NAME: unbound variable". Fail fast here with an actionable message
+# source silently reads *nothing*, so every var falls back to its default and
+# the run misbehaves later with a baffling error (e.g. a missing CONTAINER_NAME
+# surfacing as an "unbound variable"). Fail fast here with an actionable message
 # instead. (The guard itself uses only 3.2-safe syntax.)
 if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] || \
    { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 3 ]; }; then
@@ -53,6 +53,14 @@ echo "==================================="
 # Load environment variables from .env file
 ENV_FILE="${SCRIPT_DIR}/.env"
 if [ -f "$ENV_FILE" ]; then
+  # Fail fast if the file exists but we can't read it (e.g. wrong owner/mode
+  # under a cron/systemd run user). Otherwise the `tr` below would produce an
+  # empty stream that `source` reads successfully, silently falling back to
+  # every default and dying later with a misleading "X is not set".
+  if [ ! -r "$ENV_FILE" ]; then
+    echo "Error: $ENV_FILE exists but is not readable by user '$(id -un)'." >&2
+    exit 1
+  fi
   set -a
   # Source with carriage returns stripped so a .env saved with Windows (CRLF)
   # line endings can't break us. Stripping at source time (not after) is what
@@ -70,7 +78,7 @@ fi
 
 # Normalize feature flags with defaults
 USE_CREDENTIALS=$(echo "${USE_CREDENTIALS:-true}" | tr '[:upper:]' '[:lower:]')
-USE_REMOTE=$(echo "${USE_REMOTE:-true}" | tr '[:upper:]' '[:lower:]')
+USE_REMOTE=$(echo "${USE_REMOTE:-false}" | tr '[:upper:]' '[:lower:]')
 
 # Function to check if the required environment variables are set correctly
 health_check() {
@@ -190,9 +198,14 @@ backup() {
   local AUTH_ARGS=()
   build_mongo_auth_args AUTH_ARGS
 
-  local DUMP_ARGS=( "--archive=$BACKUP_FILE_NAME" "--gzip" "${AUTH_ARGS[@]}" )
-  # Set to the collection name when we use --collection, so we can detect that
-  # mongodump reported the namespace missing (it exits 0 in that case).
+  # Empty arrays are expanded with the ${arr[@]+"${arr[@]}"} idiom throughout:
+  # on bash 4.3 (which the guard admits) a bare "${arr[@]}" on an *empty* array
+  # aborts under `set -u` with "unbound variable" (only fixed in 4.4). AUTH_ARGS
+  # is empty whenever USE_CREDENTIALS=false.
+  local DUMP_ARGS=( "--archive=$BACKUP_FILE_NAME" "--gzip" ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} )
+  # Set to the collection name only on the no-mongosh single-collection path,
+  # where we can't preflight and must instead detect a missing namespace from
+  # mongodump's output (it exits 0 in that case).
   local SINGLE_COLLECTION=""
 
   if [ -n "$COLLECTIONS_CSV" ]; then
@@ -204,62 +217,75 @@ backup() {
     fi
     echo "Backing up collections from ${MONGO_DB_NAME}: ${COLLECTIONS[*]}"
 
-    if [ "${#COLLECTIONS[@]}" -eq 1 ]; then
-      # A single collection is dumped directly with --collection, which needs no
-      # mongosh. mongodump exits 0 even when the collection is missing (it logs
-      # "does not exist"), so we validate via the dump output after running it.
-      DUMP_ARGS+=( "--db=$MONGO_DB_NAME" "--collection=${COLLECTIONS[0]}" )
-      SINGLE_COLLECTION="${COLLECTIONS[0]}"
+    # When mongosh is available, fetch the DB's real collection list once and use
+    # it to (a) fail fast on a missing/typo'd collection instead of silently
+    # dumping an empty archive, and (b) build the exclude list for the
+    # multi-collection case. Only multi-collection strictly needs mongosh; a
+    # single collection can still fall back to --collection + output check.
+    local have_mongosh=0
+    if docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
+      have_mongosh=1
+    fi
+
+    if [ "$have_mongosh" -eq 1 ]; then
+      local MONGOSH_AUTH=()
+      build_mongosh_auth_args MONGOSH_AUTH
+      # JSON-encode the DB name into a JS string literal so a name containing a
+      # quote or backslash can't alter the --eval script (see verify / json_str).
+      local DB_JS
+      DB_JS=$(json_str "$MONGO_DB_NAME")
+      local ALL_COLLECTIONS
+      ALL_COLLECTIONS=$(docker exec "$CONTAINER_NAME" mongosh --quiet ${MONGOSH_AUTH[@]+"${MONGOSH_AUTH[@]}"} \
+        --eval "db.getSiblingDB(${DB_JS}).getCollectionNames().forEach(function (n) { print(n); })")
+
+      if [ "${#COLLECTIONS[@]}" -eq 1 ]; then
+        # Fail fast if the single collection doesn't exist: mongodump would exit
+        # 0 and write an empty archive that then masquerades as a good backup.
+        if ! printf '%s\n' "$ALL_COLLECTIONS" | grep -qxF -- "${COLLECTIONS[0]}"; then
+          echo "Error: collection '${COLLECTIONS[0]}' does not exist in ${MONGO_DB_NAME}; nothing to back up." >&2
+          exit 1
+        fi
+        DUMP_ARGS+=( "--db=$MONGO_DB_NAME" "--collection=${COLLECTIONS[0]}" )
+      else
+        # Warn about requested collections that don't exist.
+        local req
+        for req in "${COLLECTIONS[@]}"; do
+          if ! printf '%s\n' "$ALL_COLLECTIONS" | grep -qxF -- "$req"; then
+            echo "Warning: requested collection '$req' not found in ${MONGO_DB_NAME}; skipping."
+          fi
+        done
+        # mongodump can't include multiple specific collections in one pass, so
+        # dump the whole DB minus every existing collection that wasn't requested.
+        DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
+        local kept=0 existing want
+        while IFS= read -r existing; do
+          [ -z "$existing" ] && continue
+          local keep=0
+          for want in "${COLLECTIONS[@]}"; do
+            if [ "$existing" = "$want" ]; then keep=1; break; fi
+          done
+          if [ "$keep" -eq 1 ]; then
+            kept=$((kept + 1))
+          else
+            DUMP_ARGS+=( "--excludeCollection=$existing" )
+          fi
+        done <<< "$ALL_COLLECTIONS"
+        if [ "$kept" -eq 0 ]; then
+          echo "Error: none of the requested collections exist in ${MONGO_DB_NAME}."
+          exit 1
+        fi
+      fi
     else
-      # mongodump can't include multiple specific collections in one pass, so
-      # dump the whole DB minus everything not requested. Building that exclude
-      # list needs the full collection list, which we read with mongosh.
-      if ! docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
+      # No mongosh in the container: multi-collection can't build its exclude
+      # list, so require it; a single collection still works via --collection,
+      # validated from the dump output afterward.
+      if [ "${#COLLECTIONS[@]}" -ne 1 ]; then
         echo "Error: backing up more than one collection needs mongosh inside container '${CONTAINER_NAME}'."
         echo "       Back them up one at a time, or use a container image that includes mongosh."
         exit 1
       fi
-
-      local MONGOSH_AUTH=()
-      if [ "$USE_CREDENTIALS" != "false" ]; then
-        MONGOSH_AUTH=( --username "$MONGO_USER" --password "$MONGO_PASSWORD" --authenticationDatabase admin )
-      fi
-      # JSON-escape the DB name into a JS string literal (see restore preflight).
-      local DB_ESC="${MONGO_DB_NAME//\\/\\\\}"
-      DB_ESC="${DB_ESC//\"/\\\"}"
-
-      local ALL_COLLECTIONS
-      ALL_COLLECTIONS=$(docker exec "$CONTAINER_NAME" mongosh --quiet "${MONGOSH_AUTH[@]}" \
-        --eval "db.getSiblingDB(\"${DB_ESC}\").getCollectionNames().forEach(function (n) { print(n); })")
-
-      # Warn about requested collections that don't exist.
-      local req
-      for req in "${COLLECTIONS[@]}"; do
-        if ! printf '%s\n' "$ALL_COLLECTIONS" | grep -qxF -- "$req"; then
-          echo "Warning: requested collection '$req' not found in ${MONGO_DB_NAME}; skipping."
-        fi
-      done
-
-      # Exclude every existing collection that wasn't requested.
-      DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
-      local kept=0 existing want
-      while IFS= read -r existing; do
-        [ -z "$existing" ] && continue
-        local keep=0
-        for want in "${COLLECTIONS[@]}"; do
-          if [ "$existing" = "$want" ]; then keep=1; break; fi
-        done
-        if [ "$keep" -eq 1 ]; then
-          kept=$((kept + 1))
-        else
-          DUMP_ARGS+=( "--excludeCollection=$existing" )
-        fi
-      done <<< "$ALL_COLLECTIONS"
-
-      if [ "$kept" -eq 0 ]; then
-        echo "Error: none of the requested collections exist in ${MONGO_DB_NAME}."
-        exit 1
-      fi
+      DUMP_ARGS+=( "--db=$MONGO_DB_NAME" "--collection=${COLLECTIONS[0]}" )
+      SINGLE_COLLECTION="${COLLECTIONS[0]}"
     fi
   else
     DUMP_ARGS+=( "--db=$MONGO_DB_NAME" )
@@ -324,7 +350,10 @@ backup() {
         case "$s3_name" in mongo_backup_*.gz) ;; *) continue ;; esac
         s3_ts=${s3_name#mongo_backup_}; s3_ts=${s3_ts%.gz}
         s3_digits=${s3_ts//[^0-9]/}
-        [ -n "$s3_digits" ] || continue   # skip names without a parseable timestamp
+        # Require a full YYYYMMDDHHMMSS (14 digits): a glob-matching but
+        # malformed key (e.g. mongo_backup_2026.gz) would otherwise reduce to a
+        # tiny number that always sorts below the cutoff and gets deleted.
+        [ "${#s3_digits}" -eq 14 ] || continue
         if [ "$s3_digits" -lt "$cutoff_digits" ]; then
           echo "Deleting old S3 backup: $s3_key"
           aws s3 rm "s3://${S3_BUCKET_NAME}/${s3_key}" --profile "$AWS_PROFILE" \
@@ -338,8 +367,10 @@ backup() {
     echo "Skipping S3 upload because USE_REMOTE=false."
   fi
 
-  # Cleanup old backups (keep last 7 days)
-  find "$BACKUP_DIR" -type f -mtime +7 -name "*.gz" \
+  # Cleanup old backups (keep last 7 days). Restrict to this tool's own
+  # mongo_backup_*.gz names (matching the S3 prune) so an unrelated .gz a user
+  # placed in the backups dir is never deleted.
+  find "$BACKUP_DIR" -type f -mtime +7 -name "mongo_backup_*.gz" \
     -exec echo "Deleting old backup file: " {} \; -exec rm {} \;
 
   echo "Backup completed successfully at $TIMESTAMP and saved to $BACKUP_FILE."
@@ -397,9 +428,18 @@ restore() {
     case "$RESTORE_FILE" in
       /*) : ;;                                             # absolute + missing -> fail fast
       */*) [ -e "${SCRIPT_DIR}/${RESTORE_FILE}" ] && RESTORE_FILE="${SCRIPT_DIR}/${RESTORE_FILE}" ;;
-      *)  for cand in "${S3_BACKUP_DIR_TEMP}/${RESTORE_FILE}" "${BACKUP_DIR}/${RESTORE_FILE}"; do
-            if [ -e "$cand" ]; then RESTORE_FILE=$cand; break; fi
-          done ;;
+      *)  # Bare name: look in the local dumps dir and the S3-download dir. Prefer
+          # backups/ (locally produced) over backups_temp/ (a download that may be
+          # stale or partial), and refuse to guess when both hold the same name —
+          # restore uses mongorestore --drop, so picking the wrong file is
+          # destructive. Pass an explicit path to disambiguate.
+          local in_backups="${BACKUP_DIR}/${RESTORE_FILE}" in_temp="${S3_BACKUP_DIR_TEMP}/${RESTORE_FILE}"
+          if [ -e "$in_backups" ] && [ -e "$in_temp" ]; then
+            echo "Error: '$RESTORE_FILE' exists in both $BACKUP_DIR and $S3_BACKUP_DIR_TEMP; pass an explicit path to choose one." >&2
+            exit 1
+          elif [ -e "$in_backups" ]; then RESTORE_FILE=$in_backups
+          elif [ -e "$in_temp" ]; then RESTORE_FILE=$in_temp
+          fi ;;
     esac
   fi
 
@@ -461,17 +501,13 @@ restore() {
   if docker exec "$CONTAINER_NAME" sh -c 'command -v mongosh >/dev/null 2>&1'; then
     echo "Preflight: checking auth against destination database '${TARGET_DB}'..."
     local PREFLIGHT_AUTH=()
-    if [ "$USE_CREDENTIALS" != "false" ]; then
-      PREFLIGHT_AUTH=( --username "$MONGO_USER" --password "$MONGO_PASSWORD" --authenticationDatabase admin )
-    fi
-    # JSON-escape the DB name into a JS string literal so a name containing a
-    # single quote (valid in MongoDB DB names) can't build malformed --eval JS.
-    # Escape backslash first, then double quote (both forbidden in DB names, but
-    # handled defensively), and embed inside double quotes.
-    local TARGET_DB_ESC="${TARGET_DB//\\/\\\\}"
-    TARGET_DB_ESC="${TARGET_DB_ESC//\"/\\\"}"
-    if docker exec "$CONTAINER_NAME" mongosh --quiet "${PREFLIGHT_AUTH[@]}" \
-        --eval "quit((db.getSiblingDB(\"${TARGET_DB_ESC}\").runCommand({ listCollections: 1 }).ok === 1) ? 0 : 1)" >/dev/null 2>&1; then
+    build_mongosh_auth_args PREFLIGHT_AUTH
+    # JSON-encode the DB name into a JS string literal so a name containing a
+    # quote or backslash can't build malformed --eval JS (see verify / json_str).
+    local TARGET_DB_JS
+    TARGET_DB_JS=$(json_str "$TARGET_DB")
+    if docker exec "$CONTAINER_NAME" mongosh --quiet ${PREFLIGHT_AUTH[@]+"${PREFLIGHT_AUTH[@]}"} \
+        --eval "quit((db.getSiblingDB(${TARGET_DB_JS}).runCommand({ listCollections: 1 }).ok === 1) ? 0 : 1)" >/dev/null 2>&1; then
       echo "Preflight auth check passed."
     else
       echo "Error: preflight auth check failed for database '${TARGET_DB}'."
@@ -532,7 +568,7 @@ restore() {
   esac
 
   docker exec "$CONTAINER_NAME" mongorestore \
-    "${AUTH_ARGS[@]}" \
+    ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} \
     "${RESTORE_ARGS[@]}"
 
   echo "MongoDB restore completed successfully."
@@ -651,7 +687,7 @@ const srcCol = ${SRC_COL_JS};
 const dstCol = ${DST_COL_JS};
 ${JS_BODY}"
 
-  if docker exec "$CONTAINER_NAME" mongosh --quiet "${AUTH_ARGS[@]}" --eval "$JS"; then
+  if docker exec "$CONTAINER_NAME" mongosh --quiet ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} --eval "$JS"; then
     echo "Verification passed."
   else
     echo "Verification failed."
