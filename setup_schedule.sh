@@ -94,7 +94,14 @@ case "$ARG" in
         && echo "Scheduled (launchd agent $LABEL). Logs: ${SCRIPT_DIR}/logs/launchd.*.log" \
         || echo "Not scheduled."
     else
-      systemctl list-timers "${UNIT}.timer" 2>/dev/null || echo "Not scheduled."
+      # `list-timers` exits 0 even when the unit doesn't exist, so it can't tell
+      # scheduled from not-scheduled on its own. Probe for the unit file first
+      # (`systemctl cat` fails if it's absent), then show the timer details.
+      if systemctl cat "${UNIT}.timer" >/dev/null 2>&1; then
+        systemctl list-timers "${UNIT}.timer" --all
+      else
+        echo "Not scheduled."
+      fi
     fi
     exit 0 ;;
   uninstall)
