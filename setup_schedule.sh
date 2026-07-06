@@ -29,17 +29,26 @@ PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 
 die() { echo "Error: $*" >&2; exit 1; }
 
-# Escape a path/value for a systemd unit setting. systemd splits ExecStart= on
-# unquoted whitespace and treats '%' as a specifier — so a checkout path with a
-# space (or '%', '"', '\') would break the generated unit. Double any '%', then
-# wrap in double quotes with backslashes/quotes escaped so the value survives
-# both specifier expansion and command-line splitting.
+# Escape a path/value for a systemd setting that is parsed with command-line
+# quoting rules (ExecStart=, Environment=). These split on unquoted whitespace
+# and treat '%' as a specifier — so a checkout path with a space (or '%', '"',
+# '\') would break the generated unit. Double any '%', then wrap in double
+# quotes with backslashes/quotes escaped so the value survives both specifier
+# expansion and command-line splitting.
 systemd_escape_path() {
   local s=$1
   s=${s//%/%%}       # literal percent -> escaped specifier
   s=${s//\\/\\\\}    # backslash -> escaped backslash
   s=${s//\"/\\\"}    # double quote -> escaped quote
   printf '"%s"' "$s"
+}
+
+# Escape a value for a systemd setting parsed as a single literal path
+# (WorkingDirectory=). These are NOT command-line-unquoted, so a quoted value
+# like "/path" is read verbatim and rejected as non-absolute — internal spaces
+# are already fine unquoted, and only '%' (a specifier) needs doubling.
+systemd_escape_specifier() {
+  printf '%s' "${1//%/%%}"
 }
 
 [ -f "$TARGET" ] || die "mongo_backup_manager.sh not found next to this installer ($TARGET)."
@@ -163,7 +172,7 @@ BASH_DIR="$(dirname "$BASH_BIN")"
 
 # Quote/escape every path-bearing unit value so spaces or specifiers in the
 # checkout path (SCRIPT_DIR/TARGET/BASH_BIN) don't corrupt the generated unit.
-SVC_WORKDIR="$(systemd_escape_path "$SCRIPT_DIR")"
+SVC_WORKDIR="$(systemd_escape_specifier "$SCRIPT_DIR")"
 SVC_EXECSTART="$(systemd_escape_path "$BASH_BIN") $(systemd_escape_path "$TARGET") backup"
 SVC_ENV_PATH="$(systemd_escape_path "PATH=${BASH_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")"
 
