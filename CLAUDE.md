@@ -37,7 +37,7 @@ There is no linter configured; if changing the script, validate manually with
 - **Two feature flags gate whole code paths**, normalized to lowercase at the top:
   - `USE_CREDENTIALS=false` → no `--username/--password/--authenticationDatabase` args
     are passed to `mongodump`/`mongorestore`, and they're dropped from `health_check`.
-  - `USE_REMOTE=false` → all S3 upload/download/list calls are skipped, and
+  - `USE_REMOTE=false` → all S3 upload/download/list/prune calls are skipped, and
     `S3_BACKUP_PATH` is never even defined (so don't reference it unconditionally).
 - **`health_check`** runs before every command (except `help`) and builds its required-var
   list dynamically from the two flags above. Adding a new required var means updating
@@ -46,8 +46,16 @@ There is no linter configured; if changing the script, validate manually with
   never through `sh -c`. This is deliberate — it avoids shell-quoting/injection issues with
   passwords. Keep new docker exec args in arrays the same way.
 - **Backup flow**: `mongodump --archive --gzip` writes *inside* the container to a bare
-  filename, then `docker cp` pulls it to `./backups/`, then optional S3 upload, then a
-  `find -mtime +7` prune of local `*.gz`. Filenames are `mongo_backup_<TIMESTAMP>.gz`.
+  filename, then `docker cp` pulls it to `./backups/`, then `docker exec rm -f` deletes the
+  in-container copy (nothing else would — otherwise dumps pile up in the container's writable
+  layer), then optional S3 upload, then a `find -mtime +7` prune of local `*.gz`. Filenames
+  are `mongo_backup_<TIMESTAMP>.gz`.
+  **Retention runs on both sides**: after upload (when remote is on) it also prunes S3 —
+  `list-objects-v2` under the `mongodb-backups/` prefix, then deletes any `mongo_backup_*.gz`
+  whose name-embedded timestamp is >7d old. S3 has no age filter, so it relies on the
+  lexicographically-sortable filename vs a host-local cutoff (matching how `TIMESTAMP` is
+  built) — a plain string `<`, no per-object date parsing. The S3 prune is best-effort (warns,
+  doesn't abort) since the dump already uploaded; it needs `s3:ListBucket` + `s3:DeleteObject`.
 - **Restore flow**: `docker cp` the archive into the container's `/tmp`, then `mongorestore
   --drop`. With no remap args it restores `--nsInclude=${MONGO_DB_NAME}.*`. With all four
   remap args it uses `--nsInclude/--nsFrom/--nsTo` to move `src_db.src_coll → dst_db.dst_coll`
@@ -67,8 +75,20 @@ There is no linter configured; if changing the script, validate manually with
   (`json_str`), so a db/collection name containing a quote or backslash can't break or alter
   the script. Keep that split intact when editing: logic in the quoted heredoc, names via the
   escaped prelude — never interpolate raw names into the JS.
-- **Directories**: `./backups` (local dumps, git-kept but contents gitignored), `./backups_temp`
-  (S3 downloads land here), `./logs` (run separators appended per invocation; gitignored).
+- **Directories** are all anchored to the script's own location via `SCRIPT_DIR` (like
+  `LOG_FILE`/`ENV_FILE`), *not* the caller's CWD — so they resolve correctly under cron/systemd
+  where CWD is usually `$HOME`. `backups/` (local dumps, git-kept but contents gitignored),
+  `backups_temp/` (S3 downloads land here), `logs/` (gitignored). Keep new paths
+  `SCRIPT_DIR`-anchored too.
+- **Run logging**: near the top the script does `exec > >(tee -a "$LOG_FILE") 2>&1`, so *all*
+  stdout+stderr for the run is mirrored into `logs/mongo_backup_manager.log` (not just the
+  separators) while still reaching the terminal/journal; a process substitution is used (not
+  `| tee`) to preserve the script's own exit status. A `trap log_run_end EXIT` writes the
+  end separator + exit code on every exit path, so early/failed exits are still recorded.
+- **Scheduling**: `systemd/mongo-backup.{service,timer}` are ready-to-edit units that run
+  `backup` on a timer (see README "Scheduling automated backups"). The service is `Type=oneshot`
+  and sets an explicit `PATH` (cron/systemd start with a minimal one, so `docker`/`aws`/`mongosh`
+  wouldn't otherwise resolve).
 - `.env`, `*.gz`, and backup dir contents are all gitignored — never commit them.
 
 ## Adding a command

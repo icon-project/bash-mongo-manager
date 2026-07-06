@@ -1,0 +1,46 @@
+# mongo-backup.service — run one MongoDB backup to completion.
+#
+# Install:
+#   sudo cp systemd/mongo-backup.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mongo-backup.timer   # schedule it
+#   sudo systemctl start mongo-backup.service        # or run once, now
+#   journalctl -u mongo-backup.service -e            # see output
+#
+# This is Type=oneshot, so systemd will not start a second run while one is
+# still going — no flock needed for the scheduled path.
+
+[Unit]
+Description=MongoDB backup via mongo_backup_manager.sh
+# Order after Docker + the network so `docker exec` and the S3 upload can work.
+# Wants (not Requires) keeps this portable if your Docker unit has another name.
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+# Optional: notify on failure. Create mongo-backup-alert.service first (a
+# oneshot that curls a Slack/webhook), then uncomment:
+# OnFailure=mongo-backup-alert.service
+
+[Service]
+Type=oneshot
+
+# --- EDIT THESE TO MATCH YOUR DEPLOYMENT --------------------------------------
+# The user must be able to run `docker` (member of the `docker` group, or root)
+# and — when USE_REMOTE=true — must own the ~/.aws profile named by AWS_PROFILE
+# in .env. Alternatives: run as root with creds in /root/.aws, or use an EC2
+# instance role (then the profile/keys don't matter).
+User=youruser
+Group=youruser
+WorkingDirectory=/opt/mongo-backup
+ExecStart=/opt/mongo-backup/mongo_backup_manager.sh backup
+# To back up only a subset, append the comma-separated list (no spaces):
+#   ExecStart=/opt/mongo-backup/mongo_backup_manager.sh backup users,tasks
+# ------------------------------------------------------------------------------
+
+# docker / aws / mongosh are not on systemd's minimal PATH; set one explicitly.
+# /usr/local/bin covers the bundled AWS CLI installer.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Be gentle on the DB host and give a large dump room to finish.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=1h

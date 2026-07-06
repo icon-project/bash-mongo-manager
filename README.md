@@ -251,15 +251,50 @@ Verification failed.
 
 > The MongoDB user in `.env` needs read access (e.g. `read`) on **both** the source and destination databases. `verify` requires `mongosh` to be available inside the container (included in the official `mongo` images from 5.0+).
 
-## Setting up backups with cron
+## Scheduling automated backups
 
-To schedule the script to run at regular intervals, you can use cron jobs. Here's how you can set up a cron job to run the script every hour:
+The `backup` command runs to completion and exits non-zero on failure, so it schedules cleanly. Two options; a systemd timer is recommended on Linux hosts.
 
-1. Open the crontab file for editing:
+### Option A — systemd timer (recommended)
+
+Ready-to-edit unit files live in [`systemd/`](systemd/). They run `backup` on a schedule, order after Docker and the network, and send output to the journal.
+
+1. Put the script somewhere stable (e.g. `/opt/mongo-backup`) with its `.env` beside it, then edit the marked lines in `systemd/mongo-backup.service` — `User`/`Group`, `WorkingDirectory`, and `ExecStart` — so they point at that location and at a user who can reach Docker and your AWS profile.
+2. Install and enable:
    ```bash
-   crontab -e
+   sudo cp systemd/mongo-backup.{service,timer} /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now mongo-backup.timer
    ```
-2. Add the following line to the crontab file:
+3. Verify:
    ```bash
-    0 * * * * /path/to/mongo_backup_manager.sh >> /var/log/mongo_backup_manager.log 2>&1
-    ```
+   systemctl list-timers mongo-backup.timer   # next / last run
+   sudo systemctl start mongo-backup.service  # run one backup right now
+   journalctl -u mongo-backup.service -e      # read its output
+   ```
+
+The default schedule is daily at 03:00 (`OnCalendar` in `mongo-backup.timer`); change it to `hourly` or any [`OnCalendar`](https://www.freedesktop.org/software/systemd/man/systemd.time.html) expression. `Persistent=true` means a run missed while the machine was off fires at the next boot.
+
+### Option B — cron
+
+```bash
+crontab -e
+```
+```cron
+# docker/aws/mongosh are not on cron's minimal PATH — set one explicitly.
+PATH=/usr/local/bin:/usr/bin:/bin
+# Daily at 03:00. Pass the `backup` command (the whole point) and redirect output
+# so a failure is captured somewhere you can read it.
+0 3 * * * /path/to/mongo_backup_manager.sh backup >> /var/log/mongo_backup.log 2>&1
+```
+
+The cron user must be able to run `docker` (member of the `docker` group, or root) and must own the `~/.aws` profile named by `AWS_PROFILE` in `.env` (or the host must use an EC2 instance role).
+
+### Retention
+
+Every `backup` run prunes backups older than 7 days from **both** locations:
+
+- **Local** — `find -mtime +7` removes old `*.gz` files under `backups/`.
+- **S3** — objects under the `mongodb-backups/` prefix whose embedded timestamp is more than 7 days old are deleted (requires `s3:ListBucket` + `s3:DeleteObject`, both in the IAM policy above). This is best-effort: a transient S3 error warns but does not fail an otherwise-successful backup.
+
+For defence-in-depth you can *also* add an S3 **lifecycle rule** on the `mongodb-backups/` prefix to expire (or transition to Glacier) old objects, so retention still happens even if a scheduled run is skipped for a long stretch.
