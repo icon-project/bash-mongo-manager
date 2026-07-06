@@ -76,7 +76,7 @@ MONGO_USER="user"
 MONGO_PASSWORD="password"
 MONGO_DB_NAME="test"
 USE_CREDENTIALS="true" # set to false if the DB has no auth
-USE_REMOTE="true"      # set to false to skip all S3 interactions
+USE_REMOTE="false"     # set to true to enable S3 upload/download/list/prune
 ```
 | Variable           | Description                                                                |
 |--------------------|----------------------------------------------------------------------------|
@@ -87,7 +87,7 @@ USE_REMOTE="true"      # set to false to skip all S3 interactions
 | `MONGO_PASSWORD`   | MongoDB password (required only when `USE_CREDENTIALS=true`).|
 | `MONGO_DB_NAME`    | Name of the MongoDB database to backup.|
 | `USE_CREDENTIALS`  | When `false`, skips MongoDB username/password in dump/restore commands. Defaults to `true`.|
-| `USE_REMOTE`       | When `false`, skips all S3 upload/download/list actions. Defaults to `true`.|
+| `USE_REMOTE`       | When `true`, enables S3 upload/download/list/prune. Defaults to `false` (local-only); set `true` to use S3.|
 
 > If your `.env` is saved with Windows (CRLF) line endings, the script strips the trailing carriage return from these values automatically, so a stray `\r` won't break the container name, port, or S3 path. Only the CR is removed — other whitespace (e.g. inside a password) is preserved as-is.
 
@@ -130,7 +130,7 @@ The `list_backups_s3` command can be used to list all backups stored in the S3 b
 ./mongo_backup_manager.sh list_backups_s3
 ```
 
-When running locally-only without S3, set `USE_REMOTE=false` in `.env` to bypass S3 upload, download, and listing.
+S3 is off by default (`USE_REMOTE=false`), so backups stay local. To upload to (and download/list/prune from) S3, set `USE_REMOTE=true` in `.env` and provide `S3_BUCKET_NAME`/`AWS_PROFILE`.
 
 ### Downloading a Backup from S3
 

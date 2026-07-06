@@ -24,7 +24,8 @@ chmod +x mongo_backup_manager.sh          # once
 
 Requires a `.env` file beside the script (the script exits if missing). Required keys:
 `CONTAINER_NAME`, `MONGO_PORT`, `MONGO_DB_NAME`; plus `MONGO_USER`/`MONGO_PASSWORD`
-unless `USE_CREDENTIALS=false`; plus `S3_BUCKET_NAME`/`AWS_PROFILE` unless `USE_REMOTE=false`.
+unless `USE_CREDENTIALS=false`; plus `S3_BUCKET_NAME`/`AWS_PROFILE` only when `USE_REMOTE=true`
+(remote is **off by default** — `USE_REMOTE` defaults to `false`).
 See `README.md` for the full table and the required IAM policy.
 
 There is no linter configured; if changing the script, validate manually with
@@ -48,14 +49,17 @@ There is no linter configured; if changing the script, validate manually with
 - **Backup flow**: `mongodump --archive --gzip` writes *inside* the container to a bare
   filename, then `docker cp` pulls it to `./backups/`, then `docker exec rm -f` deletes the
   in-container copy (nothing else would — otherwise dumps pile up in the container's writable
-  layer), then optional S3 upload, then a `find -mtime +7` prune of local `*.gz`. Filenames
+  layer), then optional S3 upload, then a `find -mtime +7` prune of local `mongo_backup_*.gz`
+  (name-restricted so an unrelated `.gz` in the dir is never deleted). Filenames
   are `mongo_backup_<TIMESTAMP>.gz`.
   **Retention runs on both sides**: after upload (when remote is on) it also prunes S3 —
   `list-objects-v2` under the `mongodb-backups/` prefix, then deletes any `mongo_backup_*.gz`
-  whose name-embedded timestamp is >7d old. S3 has no age filter, so it relies on the
-  lexicographically-sortable filename vs a host-local cutoff (matching how `TIMESTAMP` is
-  built) — a plain string `<`, no per-object date parsing. The S3 prune is best-effort (warns,
-  doesn't abort) since the dump already uploaded; it needs `s3:ListBucket` + `s3:DeleteObject`.
+  whose name-embedded timestamp is >7d old. S3 has no age filter, so it strips each name to
+  its 14-digit `YYYYMMDDHHMMSS` and integer-compares it against a host-local cutoff built the
+  same way as `TIMESTAMP` — an integer compare, *not* a string `<` (that would be
+  locale-dependent), and names without a full 14-digit stamp are skipped. The S3 prune is
+  best-effort (warns, doesn't abort) since the dump already uploaded; it needs `s3:ListBucket`
+  + `s3:DeleteObject`.
 - **Restore flow**: `docker cp` the archive into the container's `/tmp`, then `mongorestore
   --drop`. With no remap args it restores `--nsInclude=${MONGO_DB_NAME}.*`. With all four
   remap args it uses `--nsInclude/--nsFrom/--nsTo` to move `src_db.src_coll → dst_db.dst_coll`
