@@ -377,8 +377,22 @@ restore() {
   # latter is rejected rather than silently restoring/dropping the whole DB.
   local nmode=$(( $# - 1 ))
 
+  # Resolve the backup path independently of the caller's CWD. An absolute path,
+  # or one that exists relative to CWD, is used as-is; otherwise we look for it
+  # (by the given path and by basename) under the script's own backup dirs. This
+  # lets a `download_backup` result be restored from anywhere — the dirs are
+  # SCRIPT_DIR-anchored, but under cron/systemd CWD is usually $HOME, so
+  # `restore backups_temp/foo.gz` would otherwise not be found.
   if [ ! -e "$RESTORE_FILE" ]; then
-    echo "Error: Backup file $RESTORE_FILE not found in the host."
+    local cand
+    for cand in "${S3_BACKUP_DIR_TEMP}/${RESTORE_FILE}" "${BACKUP_DIR}/${RESTORE_FILE}" \
+                "${S3_BACKUP_DIR_TEMP}/$(basename "$RESTORE_FILE")" "${BACKUP_DIR}/$(basename "$RESTORE_FILE")"; do
+      if [ -e "$cand" ]; then RESTORE_FILE=$cand; break; fi
+    done
+  fi
+
+  if [ ! -e "$RESTORE_FILE" ]; then
+    echo "Error: Backup file '$1' not found (looked relative to CWD, and in $S3_BACKUP_DIR_TEMP and $BACKUP_DIR)."
     exit 1
   fi
 
@@ -657,6 +671,8 @@ download_backup() {
   aws s3 cp "${S3_BACKUP_PATH}${DOWNLOAD_FILE}" "$S3_BACKUP_DIR_TEMP" --profile "$AWS_PROFILE"
 
   echo "Download completed successfully."
+  echo "Saved to: ${S3_BACKUP_DIR_TEMP}/$(basename "$DOWNLOAD_FILE")"
+  echo "Restore it from anywhere with: $0 restore $(basename "$DOWNLOAD_FILE")"
 }
 
 # Function to display help information
