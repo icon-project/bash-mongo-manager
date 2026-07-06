@@ -288,7 +288,7 @@ PATH=/usr/local/bin:/usr/bin:/bin
 0 3 * * * /path/to/mongo_backup_manager.sh backup >> /var/log/mongo_backup.log 2>&1
 ```
 
-The cron user must be able to run `docker` (member of the `docker` group, or root) and must own the `~/.aws` profile named by `AWS_PROFILE` in `.env` (or the host must use an EC2 instance role).
+The cron user must be able to run `docker` (member of the `docker` group, or root) and — since the script always calls `aws` with `--profile "$AWS_PROFILE"` (and `health_check` requires `AWS_PROFILE`) — must own the `~/.aws` profile named by `AWS_PROFILE` in `.env`. A named profile is required even on EC2: to use an instance role, point the profile at it (`credential_source = Ec2InstanceMetadata` in `~/.aws/config`) rather than omitting the profile.
 
 ### Retention
 
