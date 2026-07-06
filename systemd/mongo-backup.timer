@@ -1,0 +1,19 @@
+# mongo-backup.timer — schedule mongo-backup.service.
+# Enable with: sudo systemctl enable --now mongo-backup.timer
+# Inspect with: systemctl list-timers mongo-backup.timer
+
+[Unit]
+Description=Schedule MongoDB backup (mongo-backup.service)
+
+[Timer]
+# Daily at 03:00 local time. The script prunes local backups older than 7 days,
+# so a daily cadence keeps ~7 local files. Change to `hourly`, `*-*-* */6:00:00`
+# (every 6h), or any systemd.time(7) OnCalendar expression.
+OnCalendar=*-*-* 03:00:00
+# If the machine was off at 03:00, run as soon as it's back instead of skipping.
+Persistent=true
+# Jitter the start so this doesn't stampede alongside other 03:00 timers.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
