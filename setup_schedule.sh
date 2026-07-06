@@ -51,6 +51,20 @@ systemd_escape_specifier() {
   printf '%s' "${1//%/%%}"
 }
 
+# Escape a value for interpolation into an XML <string> element (launchd plist).
+# A valid macOS path can contain '&', '<', or '>' (e.g. ~/R&D/…), which would
+# otherwise produce malformed XML that plutil rejects. Escape '&' first so the
+# entities we introduce for '<'/'>' aren't double-escaped.
+xml_escape() {
+  local s=$1
+  # '&' is special in ${//} replacements (it stands for the matched text), so
+  # each entity's leading '&' must be backslash-escaped to emit a literal one.
+  s=${s//&/\&amp;}
+  s=${s//</\&lt;}
+  s=${s//>/\&gt;}
+  printf '%s' "$s"
+}
+
 [ -f "$TARGET" ] || die "mongo_backup_manager.sh not found next to this installer ($TARGET)."
 
 # Pick a bash >= 4.3 to run the backup with. macOS ships 3.2 as /bin/bash, where
@@ -121,6 +135,12 @@ if [ "$OS" = "Darwin" ]; then
     <key>Minute</key><integer>${SCHED_MIN}</integer>"
   fi
   mkdir -p "$(dirname "$PLIST")"
+  # XML-escape every path before it lands in a <string> element, so a checkout
+  # path with '&', '<', or '>' doesn't produce a malformed plist.
+  X_BASH_BIN="$(xml_escape "$BASH_BIN")"
+  X_TARGET="$(xml_escape "$TARGET")"
+  X_SCRIPT_DIR="$(xml_escape "$SCRIPT_DIR")"
+  X_PATH="$(xml_escape "$(dirname "$BASH_BIN")"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
   cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -129,21 +149,21 @@ if [ "$OS" = "Darwin" ]; then
   <key>Label</key><string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${BASH_BIN}</string>
-    <string>${TARGET}</string>
+    <string>${X_BASH_BIN}</string>
+    <string>${X_TARGET}</string>
     <string>backup</string>
   </array>
-  <key>WorkingDirectory</key><string>${SCRIPT_DIR}</string>
+  <key>WorkingDirectory</key><string>${X_SCRIPT_DIR}</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>$(dirname "$BASH_BIN"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>${X_PATH}</string>
   </dict>
   <key>StartCalendarInterval</key>
   <dict>
 ${CAL}
   </dict>
-  <key>StandardOutPath</key><string>${SCRIPT_DIR}/logs/launchd.out.log</string>
-  <key>StandardErrorPath</key><string>${SCRIPT_DIR}/logs/launchd.err.log</string>
+  <key>StandardOutPath</key><string>${X_SCRIPT_DIR}/logs/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>${X_SCRIPT_DIR}/logs/launchd.err.log</string>
 </dict>
 </plist>
 PLIST_EOF
