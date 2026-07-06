@@ -40,9 +40,6 @@ Ensure the IAM user associated with the AWS credentials has the correct permissi
     "Statement": [
         {
             "Effect": "Allow",
-            "Principal": {
-                "AWS": "arn:aws:iam::ACCOUNT:user/USER"
-            },
             "Action": [
                 "s3:GetBucketLocation",
                 "s3:ListBucket"
@@ -51,9 +48,6 @@ Ensure the IAM user associated with the AWS credentials has the correct permissi
         },
         {
             "Effect": "Allow",
-            "Principal": {
-                "AWS": "arn:aws:iam::ACCOUNT:user/USER"
-            },
             "Action": [
                 "s3:GetObject",
                 "s3:PutObject",
