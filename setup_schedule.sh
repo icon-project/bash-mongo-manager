@@ -29,6 +29,19 @@ PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+# Escape a path/value for a systemd unit setting. systemd splits ExecStart= on
+# unquoted whitespace and treats '%' as a specifier — so a checkout path with a
+# space (or '%', '"', '\') would break the generated unit. Double any '%', then
+# wrap in double quotes with backslashes/quotes escaped so the value survives
+# both specifier expansion and command-line splitting.
+systemd_escape_path() {
+  local s=$1
+  s=${s//%/%%}       # literal percent -> escaped specifier
+  s=${s//\\/\\\\}    # backslash -> escaped backslash
+  s=${s//\"/\\\"}    # double quote -> escaped quote
+  printf '"%s"' "$s"
+}
+
 [ -f "$TARGET" ] || die "mongo_backup_manager.sh not found next to this installer ($TARGET)."
 
 # Pick a bash >= 4.3 to run the backup with. macOS ships 3.2 as /bin/bash, where
@@ -148,6 +161,12 @@ fi
 RUN_USER="$(id -un)"; RUN_GROUP="$(id -gn)"
 BASH_DIR="$(dirname "$BASH_BIN")"
 
+# Quote/escape every path-bearing unit value so spaces or specifiers in the
+# checkout path (SCRIPT_DIR/TARGET/BASH_BIN) don't corrupt the generated unit.
+SVC_WORKDIR="$(systemd_escape_path "$SCRIPT_DIR")"
+SVC_EXECSTART="$(systemd_escape_path "$BASH_BIN") $(systemd_escape_path "$TARGET") backup"
+SVC_ENV_PATH="$(systemd_escape_path "PATH=${BASH_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")"
+
 SVC_TMP="$(mktemp)"; TMR_TMP="$(mktemp)"
 cat > "$SVC_TMP" <<SVC_EOF
 [Unit]
@@ -159,9 +178,9 @@ After=network-online.target docker.service
 Type=oneshot
 User=${RUN_USER}
 Group=${RUN_GROUP}
-WorkingDirectory=${SCRIPT_DIR}
-ExecStart=${BASH_BIN} ${TARGET} backup
-Environment=PATH=${BASH_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WorkingDirectory=${SVC_WORKDIR}
+ExecStart=${SVC_EXECSTART}
+Environment=${SVC_ENV_PATH}
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=1h
