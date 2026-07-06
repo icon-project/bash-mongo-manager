@@ -59,7 +59,7 @@ Ensure the IAM user associated with the AWS credentials has the correct permissi
                 "s3:PutObject",
                 "s3:DeleteObject"
             ],
-            "Resource": "arn:aws:s3:::BUCKET"
+            "Resource": "arn:aws:s3:::BUCKET/mongodb-backups/*"
         }
     ]
 }

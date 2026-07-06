@@ -26,8 +26,11 @@ Type=oneshot
 # --- EDIT THESE TO MATCH YOUR DEPLOYMENT --------------------------------------
 # The user must be able to run `docker` (member of the `docker` group, or root)
 # and — when USE_REMOTE=true — must own the ~/.aws profile named by AWS_PROFILE
-# in .env. Alternatives: run as root with creds in /root/.aws, or use an EC2
-# instance role (then the profile/keys don't matter).
+# in .env. The script always calls aws with `--profile "$AWS_PROFILE"`, so a
+# named profile must exist even on EC2: to use an instance role, point the
+# profile at it (`credential_source = Ec2InstanceMetadata` in ~/.aws/config)
+# rather than dropping the profile. Or run as root with a profile under
+# /root/.aws.
 User=youruser
 Group=youruser
 WorkingDirectory=/opt/mongo-backup
