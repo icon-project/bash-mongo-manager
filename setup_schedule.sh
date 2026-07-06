@@ -57,8 +57,10 @@ systemd_escape_specifier() {
 # entities we introduce for '<'/'>' aren't double-escaped.
 xml_escape() {
   local s=$1
-  # '&' is special in ${//} replacements (it stands for the matched text), so
-  # each entity's leading '&' must be backslash-escaped to emit a literal one.
+  # In bash 5.1+ (what macOS ships via Homebrew, i.e. the interpreter this runs
+  # under) '&' in a ${//} replacement stands for the matched text, so each
+  # entity's leading '&' is backslash-escaped to emit a literal one — otherwise
+  # '<' would become '<lt;' instead of '&lt;'.
   s=${s//&/\&amp;}
   s=${s//</\&lt;}
   s=${s//>/\&gt;}
@@ -88,7 +90,7 @@ OS="$(uname -s)"
 case "$ARG" in
   status)
     if [ "$OS" = "Darwin" ]; then
-      launchctl list 2>/dev/null | grep -q "$LABEL" \
+      launchctl list 2>/dev/null | grep -Fq "$LABEL" \
         && echo "Scheduled (launchd agent $LABEL). Logs: ${SCRIPT_DIR}/logs/launchd.*.log" \
         || echo "Not scheduled."
     else
