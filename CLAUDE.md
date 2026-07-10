@@ -54,12 +54,16 @@ There is no linter configured; if changing the script, validate manually with
   are `mongo_backup_<TIMESTAMP>.gz`.
   **Retention runs on both sides**: after upload (when remote is on) it also prunes S3 —
   `list-objects-v2` under the `mongodb-backups/` prefix, then deletes any `mongo_backup_*.gz`
-  whose name-embedded timestamp is >7d old. S3 has no age filter, so it strips each name to
+  whose name-embedded timestamp is older than `S3_RETENTION_DAYS` (env var, default `7`). S3
+  has no age filter, so it strips each name to
   its 14-digit `YYYYMMDDHHMMSS` and integer-compares it against a host-local cutoff built the
   same way as `TIMESTAMP` — an integer compare, *not* a string `<` (that would be
   locale-dependent), and names without a full 14-digit stamp are skipped. The S3 prune is
   best-effort (warns, doesn't abort) since the dump already uploaded; it needs `s3:ListBucket`
-  + `s3:DeleteObject`.
+  + `s3:DeleteObject`. `S3_RETENTION_DAYS=0` skips the S3 prune entirely (an S3 lifecycle
+  policy owns retention instead); `health_check` validates it as a non-negative integer when
+  `USE_REMOTE=true`. Only the S3 side is configurable — the local `find -mtime +7` is still
+  fixed at 7 days.
 - **Restore flow**: `docker cp` the archive into the container's `/tmp`, then `mongorestore
   --drop`. With no remap args it restores `--nsInclude=${MONGO_DB_NAME}.*`. With all four
   remap args it uses `--nsInclude/--nsFrom/--nsTo` to move `src_db.src_coll → dst_db.dst_coll`

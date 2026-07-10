@@ -80,6 +80,12 @@ fi
 USE_CREDENTIALS=$(echo "${USE_CREDENTIALS:-true}" | tr '[:upper:]' '[:lower:]')
 USE_REMOTE=$(echo "${USE_REMOTE:-false}" | tr '[:upper:]' '[:lower:]')
 
+# Number of days after which S3 backups are pruned. Default 7 (unchanged from the
+# hard-coded value it replaces, so existing deployments are unaffected). 0 skips
+# the S3 prune entirely, delegating retention to an S3 lifecycle policy on the
+# bucket (one source of truth). Validated in health_check before use.
+S3_RETENTION_DAYS="${S3_RETENTION_DAYS:-7}"
+
 # Function to check if the required environment variables are set correctly
 health_check() {
   echo "Performing health check..."
@@ -95,6 +101,13 @@ health_check() {
   # Only require remote settings when remote operations are enabled
   if [ "$USE_REMOTE" != "false" ]; then
     REQUIRED_VARS+=("S3_BUCKET_NAME" "AWS_PROFILE")
+
+    # S3_RETENTION_DAYS gates the S3 prune, so a typo must not silently disable
+    # pruning *and* skip the lifecycle rule. Require a non-negative integer.
+    if ! [[ "$S3_RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+      echo "Error: S3_RETENTION_DAYS must be a non-negative integer (got '$S3_RETENTION_DAYS')."
+      exit 1
+    fi
   fi
 
   # Check if each variable is set
@@ -324,7 +337,10 @@ backup() {
     aws s3 cp "$BACKUP_FILE" "$S3_BACKUP_PATH" --profile "$AWS_PROFILE"
     echo "Backup uploaded to S3 successfully."
 
-    # Prune S3 backups older than 7 days (mirrors the local find -mtime +7 below).
+    # Prune S3 backups older than S3_RETENTION_DAYS (default 7, mirroring the local
+    # find -mtime +7 below). S3_RETENTION_DAYS=0 skips this block entirely, handing
+    # retention to an S3 lifecycle policy on the bucket (see README) so the tool and
+    # the lifecycle rule don't compete over the same objects.
     # S3 has no server-side age filter, so list the keys under the prefix and
     # compare the timestamp embedded in each backup's name against a cutoff built
     # the same way the names are (host-local time, like TIMESTAMP above). The name
@@ -337,31 +353,35 @@ backup() {
     # best-effort: the dump already uploaded, so a transient S3 error warns rather
     # than failing the run. Needs s3:ListBucket + s3:DeleteObject (see README).
     local cutoff_epoch cutoff_ts cutoff_digits s3_keys s3_key s3_name s3_ts s3_digits
-    cutoff_epoch=$(( $(date +%s) - 7 * 86400 ))
-    cutoff_ts=$(date -r "$cutoff_epoch" +%Y-%m-%d_%H-%M-%S 2>/dev/null \
-             || date -d "@$cutoff_epoch" +%Y-%m-%d_%H-%M-%S)
-    cutoff_digits=${cutoff_ts//[^0-9]/}
-    if s3_keys=$(aws s3api list-objects-v2 \
-                   --bucket "$S3_BUCKET_NAME" --prefix "mongodb-backups/" \
-                   --query 'Contents[].Key' --output text --profile "$AWS_PROFILE"); then
-      while IFS= read -r s3_key; do
-        [ -n "$s3_key" ] && [ "$s3_key" != "None" ] || continue
-        s3_name=${s3_key##*/}
-        case "$s3_name" in mongo_backup_*.gz) ;; *) continue ;; esac
-        s3_ts=${s3_name#mongo_backup_}; s3_ts=${s3_ts%.gz}
-        s3_digits=${s3_ts//[^0-9]/}
-        # Require a full YYYYMMDDHHMMSS (14 digits): a glob-matching but
-        # malformed key (e.g. mongo_backup_2026.gz) would otherwise reduce to a
-        # tiny number that always sorts below the cutoff and gets deleted.
-        [ "${#s3_digits}" -eq 14 ] || continue
-        if [ "$s3_digits" -lt "$cutoff_digits" ]; then
-          echo "Deleting old S3 backup: $s3_key"
-          aws s3 rm "s3://${S3_BUCKET_NAME}/${s3_key}" --profile "$AWS_PROFILE" \
-            || echo "Warning: failed to delete s3://${S3_BUCKET_NAME}/${s3_key}" >&2
-        fi
-      done <<< "$(printf '%s' "$s3_keys" | tr '\t' '\n')"
+    if [ "$S3_RETENTION_DAYS" -eq 0 ]; then
+      echo "S3_RETENTION_DAYS=0 -> skipping S3 prune (lifecycle policy owns retention)."
     else
-      echo "Warning: could not list S3 objects for retention; skipping remote prune." >&2
+      cutoff_epoch=$(( $(date +%s) - S3_RETENTION_DAYS * 86400 ))
+      cutoff_ts=$(date -r "$cutoff_epoch" +%Y-%m-%d_%H-%M-%S 2>/dev/null \
+               || date -d "@$cutoff_epoch" +%Y-%m-%d_%H-%M-%S)
+      cutoff_digits=${cutoff_ts//[^0-9]/}
+      if s3_keys=$(aws s3api list-objects-v2 \
+                     --bucket "$S3_BUCKET_NAME" --prefix "mongodb-backups/" \
+                     --query 'Contents[].Key' --output text --profile "$AWS_PROFILE"); then
+        while IFS= read -r s3_key; do
+          [ -n "$s3_key" ] && [ "$s3_key" != "None" ] || continue
+          s3_name=${s3_key##*/}
+          case "$s3_name" in mongo_backup_*.gz) ;; *) continue ;; esac
+          s3_ts=${s3_name#mongo_backup_}; s3_ts=${s3_ts%.gz}
+          s3_digits=${s3_ts//[^0-9]/}
+          # Require a full YYYYMMDDHHMMSS (14 digits): a glob-matching but
+          # malformed key (e.g. mongo_backup_2026.gz) would otherwise reduce to a
+          # tiny number that always sorts below the cutoff and gets deleted.
+          [ "${#s3_digits}" -eq 14 ] || continue
+          if [ "$s3_digits" -lt "$cutoff_digits" ]; then
+            echo "Deleting old S3 backup: $s3_key"
+            aws s3 rm "s3://${S3_BUCKET_NAME}/${s3_key}" --profile "$AWS_PROFILE" \
+              || echo "Warning: failed to delete s3://${S3_BUCKET_NAME}/${s3_key}" >&2
+          fi
+        done <<< "$(printf '%s' "$s3_keys" | tr '\t' '\n')"
+      else
+        echo "Warning: could not list S3 objects for retention; skipping remote prune." >&2
+      fi
     fi
   else
     echo "Skipping S3 upload because USE_REMOTE=false."
