@@ -108,6 +108,11 @@ health_check() {
       echo "Error: S3_RETENTION_DAYS must be a non-negative integer (got '$S3_RETENTION_DAYS')."
       exit 1
     fi
+    # Normalize to base 10 up front. Bash arithmetic (both the `-eq 0` test and
+    # the cutoff below) treats a leading-zero value as octal, so a valid-looking
+    # `08` would abort with "value too great for base" and `010` would prune at 8
+    # days, not 10. Canonicalizing here fixes both use sites at once.
+    S3_RETENTION_DAYS=$((10#$S3_RETENTION_DAYS))
   fi
 
   # Check if each variable is set
