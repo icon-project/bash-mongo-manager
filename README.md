@@ -88,6 +88,7 @@ USE_REMOTE="false"     # set to true to enable S3 upload/download/list/prune
 | `MONGO_DB_NAME`    | Name of the MongoDB database to backup.|
 | `USE_CREDENTIALS`  | When `false`, skips MongoDB username/password in dump/restore commands. Defaults to `true`.|
 | `USE_REMOTE`       | When `true`, enables S3 upload/download/list/prune. Defaults to `false` (local-only); set `true` to use S3.|
+| `S3_RETENTION_DAYS`| Days after which S3 backups are pruned. Defaults to `7`. `0` skips the S3 prune entirely so an S3 lifecycle rule owns retention. Must be a non-negative integer (validated when `USE_REMOTE=true`). Only affects S3 — the local disk prune is always 7 days.|
 
 > If your `.env` is saved with Windows (CRLF) line endings, the script strips the trailing carriage return from these values automatically, so a stray `\r` won't break the container name, port, or S3 path. Only the CR is removed — other whitespace (e.g. inside a password) is preserved as-is.
 
@@ -286,9 +287,11 @@ The cron user must be able to run `docker` (member of the `docker` group, or roo
 
 ### Retention
 
-Every `backup` run prunes backups older than 7 days from **both** locations:
+Every `backup` run prunes old backups from **both** locations:
 
-- **Local** — `find -mtime +7` removes old `*.gz` files under `backups/`.
-- **S3** — objects under the `mongodb-backups/` prefix whose embedded timestamp is more than 7 days old are deleted (requires `s3:ListBucket` + `s3:DeleteObject`, both in the IAM policy above). This is best-effort: a transient S3 error warns but does not fail an otherwise-successful backup.
+- **Local** — `find -mtime +7` removes `*.gz` files older than 7 days under `backups/` (fixed at 7 days).
+- **S3** — objects under the `mongodb-backups/` prefix whose embedded timestamp is older than `S3_RETENTION_DAYS` (default 7) are deleted (requires `s3:ListBucket` + `s3:DeleteObject`, both in the IAM policy above). This is best-effort: a transient S3 error warns but does not fail an otherwise-successful backup.
 
 For defence-in-depth you can *also* add an S3 **lifecycle rule** on the `mongodb-backups/` prefix to expire (or transition to Glacier) old objects, so retention still happens even if a scheduled run is skipped for a long stretch.
+
+**Letting a lifecycle policy own S3 retention:** set `S3_RETENTION_DAYS=0` to skip the tool's S3 prune entirely and make an S3 lifecycle rule the single source of truth for how long backups live. Without this, the tool's prune competes with the lifecycle rule — e.g. a 30-day lifecycle rule never sees anything older than 7 days because the tool already deleted it on the previous run. Use `0` when you want longer (or tiered) S3 retention managed by the bucket, and keep the default `7` when you want the tool to handle it.
