@@ -1,0 +1,45 @@
+# mongo-backup-alert.service — best-effort failure notifier for mongo-backup.service.
+#
+# Wired via `OnFailure=mongo-backup-alert.service` in mongo-backup.service:
+# systemd starts this oneshot whenever a scheduled backup exits non-zero. It runs
+# `mongo_backup_manager.sh alert mongo-backup.service`, which tails that unit's
+# journal — carrying the ">>> STAGE: ..." markers and the "Run FAILED during
+# stage: ..." line — and posts it to Discord and/or Telegram. So the alert shows
+# which stage died (mongodump vs the S3 upload vs a prune), not just "it failed".
+#
+# Install alongside the backup units:
+#   sudo cp systemd/mongo-backup-alert.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#
+# Configure destinations in the SAME .env the backup uses (NEVER committed):
+#   USE_ALERTS=true
+#   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...   # and/or
+#   TELEGRAM_BOT_TOKEN=123456:AA...   TELEGRAM_CHAT_ID=-1001234567890
+#
+# Test it without breaking anything real (it just posts a "no journal" style
+# message if the backup unit hasn't failed):
+#   sudo systemctl start mongo-backup-alert.service
+#   journalctl -u mongo-backup-alert.service -e
+
+[Unit]
+Description=Send a failure alert for mongo-backup.service (Discord/Telegram)
+
+[Service]
+Type=oneshot
+
+# --- EDIT THESE TO MATCH mongo-backup.service --------------------------------
+# No User=/Group= is set, so this runs as root. That's deliberate: reading a
+# *system* unit's journal (`journalctl -u mongo-backup.service`) needs privilege,
+# and root can also read the backup's .env for the alert secrets. If you instead
+# run it as a non-root user, that user must be in the `systemd-journal` group and
+# able to read the .env.
+WorkingDirectory=/opt/mongo-backup
+ExecStart=/opt/mongo-backup/mongo_backup_manager.sh alert mongo-backup.service
+# -----------------------------------------------------------------------------
+
+# curl / journalctl are not on systemd's minimal PATH; set one explicitly
+# (mirrors mongo-backup.service).
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Never let a failed/slow alert hang around.
+TimeoutStartSec=60

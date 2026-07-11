@@ -16,9 +16,12 @@ Description=MongoDB backup via mongo_backup_manager.sh
 # Wants (not Requires) keeps this portable if your Docker unit has another name.
 Wants=network-online.target docker.service
 After=network-online.target docker.service
-# Optional: notify on failure. Create mongo-backup-alert.service first (a
-# oneshot that curls a Slack/webhook), then uncomment:
-# OnFailure=mongo-backup-alert.service
+# On any non-zero exit (failed mongodump OR failed S3 upload — the script runs
+# under `set -e`), start the companion alert unit, which posts this run's journal
+# tail to Discord/Telegram. Alerting only actually sends when USE_ALERTS=true and
+# a destination is configured in .env; otherwise the alert unit is a harmless
+# no-op, so leaving this enabled is safe even before you wire up secrets.
+OnFailure=mongo-backup-alert.service
 
 [Service]
 Type=oneshot

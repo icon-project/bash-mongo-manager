@@ -33,13 +33,29 @@ mkdir -p "$(dirname "$LOG_FILE")"
 # substitution (not a `| tee` pipe) keeps the script's own exit status intact.
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+# Track which stage of a run is executing so a failure is attributable — did the
+# backup die in mongodump, the S3 upload, or a prune? `stage` records the name
+# and echoes a marker into the log/journal; the end-of-run separator and the
+# failure alert (mongo-backup-alert.service, via journalctl) both read it, so an
+# unattended run's alert is unambiguous. Defined before the EXIT trap so it's
+# always set when the trap fires (guarded with :- for the earliest failures).
+CURRENT_STAGE="starting"
+stage() {
+  CURRENT_STAGE="$1"
+  echo ">>> STAGE: $1"
+}
+
 # Always close the run out with an end separator and the exit code — even on an
 # early exit or a failure under `set -e`. The trap fires on every exit path; the
 # old end-of-file block was skipped whenever the script exited early, so a failed
-# run looked like it never finished.
+# run looked like it never finished. On a non-zero exit it also names the stage
+# that was running, so the journal tail an alert forwards points at the culprit.
 log_run_end() {
   local ec=$?
   echo "-----------------------------------"
+  if [ "$ec" -ne 0 ]; then
+    echo "Run FAILED during stage: ${CURRENT_STAGE:-unknown} (exit $ec)"
+  fi
   echo "Run ended at $(date '+%Y-%m-%d %H:%M:%S') (exit $ec)"
   echo "-----------------------------------"
 }
@@ -79,6 +95,11 @@ fi
 # Normalize feature flags with defaults
 USE_CREDENTIALS=$(echo "${USE_CREDENTIALS:-true}" | tr '[:upper:]' '[:lower:]')
 USE_REMOTE=$(echo "${USE_REMOTE:-false}" | tr '[:upper:]' '[:lower:]')
+# When true, failure alerting is active: health_check validates that at least one
+# alert destination (Discord and/or Telegram) is configured, and the `alert`
+# command (invoked by mongo-backup-alert.service on failure) actually sends.
+# Off by default so existing deployments are unaffected.
+USE_ALERTS=$(echo "${USE_ALERTS:-false}" | tr '[:upper:]' '[:lower:]')
 
 # Number of days after which S3 backups are pruned. Default 7 (unchanged from the
 # hard-coded value it replaces, so existing deployments are unaffected). 0 skips
@@ -113,6 +134,29 @@ health_check() {
     # `08` would abort with "value too great for base" and `010` would prune at 8
     # days, not 10. Canonicalizing here fixes both use sites at once.
     S3_RETENTION_DAYS=$((10#$S3_RETENTION_DAYS))
+  fi
+
+  # Validate alert configuration up front when alerting is enabled, so a run that
+  # relies on being notified on failure can't silently have no working
+  # destination. A destination is usable if Discord's webhook URL is set, or if
+  # BOTH Telegram vars are set. A half-configured Telegram (token without chat id
+  # or vice versa) is flagged as an error rather than silently ignored — it's
+  # almost always a typo, and PR-#7-style "a typo can't silently disable the
+  # safety net" reasoning applies. Secret *values* are never echoed here.
+  if [ "$USE_ALERTS" != "false" ]; then
+    local tg_token="${TELEGRAM_BOT_TOKEN:-}" tg_chat="${TELEGRAM_CHAT_ID:-}"
+    if { [ -n "$tg_token" ] && [ -z "$tg_chat" ]; } || { [ -z "$tg_token" ] && [ -n "$tg_chat" ]; }; then
+      echo "Error: Telegram alerting is half-configured — set BOTH TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, or neither."
+      exit 1
+    fi
+    local have_discord=0 have_telegram=0
+    [ -n "${DISCORD_WEBHOOK_URL:-}" ] && have_discord=1
+    { [ -n "$tg_token" ] && [ -n "$tg_chat" ]; } && have_telegram=1
+    if [ "$have_discord" -eq 0 ] && [ "$have_telegram" -eq 0 ]; then
+      echo "Error: USE_ALERTS=true but no alert destination is configured."
+      echo "       Set DISCORD_WEBHOOK_URL and/or TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env, or set USE_ALERTS=false."
+      exit 1
+    fi
   fi
 
   # Check if each variable is set
@@ -189,6 +233,63 @@ json_str() {
   s=${s//\\/\\\\}
   s=${s//\"/\\\"}
   printf '"%s"' "$s"
+}
+
+# Helper: emit a value as the *inside* of a JSON string (no surrounding quotes),
+# escaping backslash, double quote, and the control chars that show up in a
+# journal tail (tab/CR/newline). Unlike json_str (single-line Mongo names) this
+# must survive multi-line text, so it handles newlines too. Order matters:
+# backslashes first. Used to build the Discord webhook payload without jq.
+json_escape_body() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\n'/\\n}
+  printf '%s' "$s"
+}
+
+# Resolve CONTAINER_NAME to the single running container it names, then rewrite
+# the global so backup/restore/verify all use the resolved value.
+#
+# Coolify (and similar orchestrators) regenerate the container's full name on
+# every redeploy — e.g. sodax-stateful-mongo-<stackhash>-<timestamp> — so a
+# hard-coded full name in .env silently breaks every `docker exec`/`docker cp`
+# after the first redeploy. To survive that, CONTAINER_NAME may be EITHER:
+#   * an exact container name (backward-compatible: it's the sole match), or
+#   * a stable name prefix (e.g. "sodax-stateful-mongo").
+# We resolve it at run time via `docker ps` (RUNNING containers only — no -a, so
+# stale stopped containers from prior deploys are ignored). Docker's `name`
+# filter is an unanchored substring match, which is exactly the prefix behavior
+# we want. We insist on EXACTLY one live match: 0 (nothing running) and >1
+# (ambiguous) are hard errors rather than a guess, because picking the wrong
+# container would back up — or, on restore, overwrite — the wrong database.
+resolve_container() {
+  stage "resolve container"
+  local matches count
+  matches=$(docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}')
+  # Count non-empty lines. `grep -c .` returns 0 (and exit 1) on empty input, so
+  # guard with `|| true` to keep `set -e` from aborting on the no-match case.
+  count=$(printf '%s\n' "$matches" | grep -c . || true)
+
+  if [ "$count" -eq 0 ]; then
+    echo "Error: CONTAINER_NAME '${CONTAINER_NAME}' matches no running container." >&2
+    echo "       Check the container is up ('docker ps') and that CONTAINER_NAME is its exact" >&2
+    echo "       name or a stable name prefix (e.g. 'sodax-stateful-mongo')." >&2
+    exit 1
+  fi
+  if [ "$count" -gt 1 ]; then
+    echo "Error: CONTAINER_NAME '${CONTAINER_NAME}' is ambiguous — it matches $count running containers:" >&2
+    while IFS= read -r m; do [ -n "$m" ] && echo "         - $m" >&2; done <<< "$matches"
+    echo "       Use the exact container name or a longer, unique prefix." >&2
+    exit 1
+  fi
+
+  if [ "$matches" != "$CONTAINER_NAME" ]; then
+    echo "Resolved container name prefix '${CONTAINER_NAME}' -> '${matches}'."
+  fi
+  CONTAINER_NAME="$matches"
 }
 
 # Function to perform backup
@@ -314,6 +415,7 @@ backup() {
   # which mongodump reports without a non-zero exit. Capture the exit status
   # without letting set -e abort first, so the mongodump diagnostics are always
   # printed before we exit on a real failure (bad creds, unreachable, disk full).
+  stage "mongodump"
   local DUMP_OUTPUT DUMP_STATUS=0
   DUMP_OUTPUT=$(docker exec "$CONTAINER_NAME" mongodump "${DUMP_ARGS[@]}" 2>&1) || DUMP_STATUS=$?
   printf '%s\n' "$DUMP_OUTPUT"
@@ -329,6 +431,7 @@ backup() {
   echo "MongoDB dump completed successfully."
 
   # Copy the backup from the container to the host
+  stage "copy dump to host"
   docker cp "$CONTAINER_NAME:$BACKUP_FILE_NAME" "$BACKUP_FILE"
 
   # Remove the in-container archive now that it's safely on the host. mongodump
@@ -339,6 +442,7 @@ backup() {
 
   # Upload the backup to S3
   if [ "$USE_REMOTE" != "false" ]; then
+    stage "S3 upload"
     aws s3 cp "$BACKUP_FILE" "$S3_BACKUP_PATH" --profile "$AWS_PROFILE"
     echo "Backup uploaded to S3 successfully."
 
@@ -357,6 +461,7 @@ backup() {
     # BSD's `-r` (macOS) first, then fall back to GNU's `-d @` (Linux). This is
     # best-effort: the dump already uploaded, so a transient S3 error warns rather
     # than failing the run. Needs s3:ListBucket + s3:DeleteObject (see README).
+    stage "S3 prune"
     local cutoff_epoch cutoff_ts cutoff_digits s3_keys s3_key s3_name s3_ts s3_digits
     if [ "$S3_RETENTION_DAYS" -eq 0 ]; then
       echo "S3_RETENTION_DAYS=0 -> skipping S3 prune (lifecycle policy owns retention)."
@@ -395,6 +500,7 @@ backup() {
   # Cleanup old backups (keep last 7 days). Restrict to this tool's own
   # mongo_backup_*.gz names (matching the S3 prune) so an unrelated .gz a user
   # placed in the backups dir is never deleted.
+  stage "local prune"
   find "$BACKUP_DIR" -type f -mtime +7 -name "mongo_backup_*.gz" \
     -exec echo "Deleting old backup file: " {} \; -exec rm {} \;
 
@@ -748,6 +854,107 @@ download_backup() {
   echo "Restore it from anywhere with: $0 restore $(basename "$DOWNLOAD_FILE")"
 }
 
+# Send a best-effort failure alert to Discord and/or Telegram.
+# Usage: alert [systemd-unit]   (unit defaults to mongo-backup.service)
+#
+# Invoked by systemd's `OnFailure=mongo-backup-alert.service` when a scheduled
+# backup exits non-zero. It reads the tail of the failed unit's journal — which
+# carries the ">>> STAGE: ..." markers and the "Run FAILED during stage:" line —
+# so the notification shows *which* stage died (mongodump vs S3 upload vs prune).
+#
+# Contract: best-effort and non-fatal. The real backup failure is already
+# recorded by systemd; this only notifies, so it must never itself abort the
+# OnFailure unit in a way that looks alarming. Each destination is attempted
+# independently (one being down must not suppress the other) and the function
+# always returns 0. Secret values (webhook URL, bot token) are never echoed, and
+# curl output is discarded so a URL/token can't leak into the log/journal.
+alert() {
+  local unit="${1:-mongo-backup.service}"
+
+  if [ "$USE_ALERTS" == "false" ]; then
+    echo "Alerting disabled (USE_ALERTS=false); not sending a failure alert."
+    return 0
+  fi
+
+  # Gather the recent journal for the failed unit. Reading a *system* unit's
+  # journal needs privilege, so mongo-backup-alert.service runs as root (see the
+  # unit file). If journalctl is unavailable or returns nothing, still send a
+  # (less specific) alert rather than staying silent.
+  local lines="${ALERT_JOURNAL_LINES:-40}"
+  local tail_text=""
+  if command -v journalctl >/dev/null 2>&1; then
+    tail_text=$(journalctl -u "$unit" -n "$lines" --no-pager -o cat 2>/dev/null || true)
+  fi
+  [ -n "$tail_text" ] || tail_text="(no journal output available for ${unit} — is this running under systemd with journal access?)"
+
+  local host when
+  host=$(hostname 2>/dev/null || echo "unknown-host")
+  when=$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "unknown-time")
+  local title="🔴 MongoDB backup FAILED on ${host} at ${when} (systemd unit: ${unit})"
+
+  local any_dest=0
+
+  # --- Discord ---
+  if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
+    any_dest=1
+    if command -v curl >/dev/null 2>&1; then
+      # Discord caps message `content` at 2000 chars; keep the fenced journal
+      # tail comfortably under that. Prefer jq to build the JSON (correct for any
+      # bytes); fall back to the in-script escaper when jq isn't installed.
+      local dmsg payload
+      dmsg=$(printf '%s\n```\n%s\n```' "$title" "$tail_text")
+      dmsg=${dmsg:0:1900}
+      if command -v jq >/dev/null 2>&1; then
+        payload=$(printf '%s' "$dmsg" | jq -Rs '{content: .}')
+      else
+        payload=$(printf '{"content":"%s"}' "$(json_escape_body "$dmsg")")
+      fi
+      # Discard curl output entirely so the webhook URL can never leak; report
+      # only pass/fail. -f fails on HTTP errors, -m bounds the hang.
+      if curl -fsS -m 15 -X POST -H "Content-Type: application/json" \
+           -d "$payload" "$DISCORD_WEBHOOK_URL" >/dev/null 2>&1; then
+        echo "Failure alert sent to Discord."
+      else
+        echo "Warning: Discord alert failed to send." >&2
+      fi
+    else
+      echo "Warning: curl not found; cannot send Discord alert." >&2
+    fi
+  fi
+
+  # --- Telegram ---
+  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+    any_dest=1
+    if command -v curl >/dev/null 2>&1; then
+      # Telegram caps `text` at 4096 chars. --data-urlencode lets curl handle all
+      # escaping, so no JSON building is needed. The bot token lives only in the
+      # URL and is never echoed (curl output is discarded).
+      local tmsg
+      tmsg=$(printf '%s\n\n%s' "$title" "$tail_text")
+      tmsg=${tmsg:0:3900}
+      if curl -fsS -m 15 -X POST \
+           --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+           --data-urlencode "text=${tmsg}" \
+           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >/dev/null 2>&1; then
+        echo "Failure alert sent to Telegram."
+      else
+        echo "Warning: Telegram alert failed to send." >&2
+      fi
+    else
+      echo "Warning: curl not found; cannot send Telegram alert." >&2
+    fi
+  fi
+
+  if [ "$any_dest" -eq 0 ]; then
+    echo "Warning: USE_ALERTS=true but no alert destination is configured; nothing sent." >&2
+    echo "         Set DISCORD_WEBHOOK_URL and/or TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env." >&2
+  fi
+
+  # Always succeed: alerting is best-effort and must not turn a send hiccup into
+  # a scary secondary failure on top of the backup failure it's reporting.
+  return 0
+}
+
 # Function to display help information
 help() {
   echo "MongoDB Backup and Restore Script"
@@ -765,11 +972,19 @@ help() {
   echo "  list_backups_s3        List all backups available in the S3 bucket."
   echo "  list_backups_local     List all backups in the local backup directory."
   echo "  download_backup [file] Download a backup from S3 and store it locally."
+  echo "  alert [unit]           Send a best-effort failure alert (Discord/Telegram) with the"
+  echo "                         tail of [unit]'s journal (default mongo-backup.service)."
+  echo "                         Meant for systemd OnFailure=, not day-to-day use."
   echo "  help                   Display this help message."
   echo
   echo "Environment Flags:"
   echo "  USE_CREDENTIALS=false  Skip MongoDB username/password when dumping/restoring."
   echo "  USE_REMOTE=false       Skip all S3 uploads/downloads/list operations."
+  echo "  USE_ALERTS=true        Enable failure alerting (needs DISCORD_WEBHOOK_URL and/or"
+  echo "                         TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)."
+  echo
+  echo "  CONTAINER_NAME may be an exact container name or a stable prefix (e.g."
+  echo "  sodax-stateful-mongo); it's resolved at run time to the single running match."
   echo
   echo "Examples:"
   echo "  ./mongo_backup_manager.sh backup"
@@ -797,6 +1012,10 @@ case "$1" in
       exit 1
     fi
     health_check
+    # Resolve CONTAINER_NAME (exact name or stable prefix) to the single running
+    # container once here, so the whole backup shares the resolved name even
+    # after a Coolify redeploy regenerated the container's suffix.
+    resolve_container
     shift
     backup "$@"
     ;;
@@ -823,11 +1042,13 @@ case "$1" in
       exit 1
     fi
     health_check
+    resolve_container
     shift
     restore "$@"
     ;;
   verify)
     health_check
+    resolve_container
     verify "${2:-}" "${3:-}" "${4:-}" "${5:-}"
     ;;
   download_backup)
@@ -838,11 +1059,23 @@ case "$1" in
     health_check
     download_backup "${2:-}"
     ;;
+  alert)
+    # Failure-notification path, normally invoked by mongo-backup-alert.service's
+    # OnFailure hook. Deliberately does NOT run health_check or resolve_container:
+    # it fires precisely when the backup broke (maybe because the container is
+    # gone), so it must stay independent of Mongo/Docker/S3 config and only needs
+    # the alert secrets. Optional arg: the systemd unit whose journal to tail.
+    if [ "$#" -gt 2 ]; then
+      echo "Error: too many arguments for alert. Pass at most one systemd unit name."
+      exit 1
+    fi
+    alert "${2:-}"
+    ;;
   help|-h|--help)
     help
     ;;
   *)
-    echo "Usage: $0 {backup|restore|verify|list_backups_s3|list_backups_local|download_backup|help} [args]"
+    echo "Usage: $0 {backup|restore|verify|list_backups_s3|list_backups_local|download_backup|alert|help} [args]"
     exit 1
     ;;
 esac
