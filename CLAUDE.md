@@ -123,11 +123,15 @@ There is no linter configured; if changing the script, validate manually with
 - **Failure alerting**: `mongo-backup.service` has `OnFailure=mongo-backup-alert.service`; that
   companion oneshot runs `mongo_backup_manager.sh alert mongo-backup.service`, which tails the
   failed unit's journal (`journalctl -u … -o cat`) and posts it to Discord and/or Telegram.
-  The tail is scoped to the unit's **most recent invocation** (`--invocation=0`, systemd v254+,
-  with a fallback to a plain across-history tail on older systemd) so a short failure right after
-  a chatty successful run isn't buried under the previous run's output; and the per-destination
-  char-cap truncation keeps the **tail** of the excerpt (not the head), so the
+  The tail is scoped to the unit's **most recent invocation** by matching its invocation ID
+  (`systemctl show -p InvocationID --value` → `journalctl _SYSTEMD_INVOCATION_ID=…`, portable back
+  to systemd v232 — *not* `--invocation=0`, which is v257+ only and would silently no-op on the
+  common v254–256), with a fallback to a plain across-history tail when the ID is unavailable — so
+  a short failure right after a chatty successful run isn't buried under the previous run's output.
+  The per-destination char-cap truncation keeps the **tail** of the excerpt (not the head), so the
   `Run FAILED during stage: …` line — always last — survives even a verbose late-stage failure.
+  (Both truncations only tail when the char budget is positive, so a pathologically long title
+  can't trip the `${var: -0}` whole-string return.)
   It runs as the **same unprivileged user** as the backup (in the `systemd-journal` group so it
   can read the unit journal), **not root** — the script `source`s `.env`, so a root alert + a
   backup-user-writable `.env` would be a local privilege escalation. As a backstop the script

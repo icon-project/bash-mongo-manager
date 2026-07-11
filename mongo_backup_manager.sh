@@ -1006,10 +1006,19 @@ alert() {
   if command -v journalctl >/dev/null 2>&1; then
     # Scope to the unit's MOST RECENT invocation (the run that just failed), so a
     # short failure right after a chatty successful run isn't buried under — or
-    # truncated away by — the previous run's output. `--invocation=0` is systemd
-    # v254+; on older systemd it errors (→ empty here) and we fall back to a plain
-    # tail across history (the original behaviour).
-    tail_text=$(journalctl -u "$unit" --invocation=0 -n "$lines" --no-pager -o cat 2>/dev/null || true)
+    # truncated away by — the previous run's output. Match on the invocation ID
+    # (`_SYSTEMD_INVOCATION_ID=`, portable back to systemd v232) rather than
+    # `--invocation=0`, which only exists on systemd v257+ — v254–256 reject it
+    # (e.g. Ubuntu 24.04 ships v255), which would silently defeat the scoping.
+    local inv=""
+    if command -v systemctl >/dev/null 2>&1; then
+      inv=$(systemctl show -p InvocationID --value "$unit" 2>/dev/null || true)
+    fi
+    if [ -n "$inv" ]; then
+      tail_text=$(journalctl _SYSTEMD_INVOCATION_ID="$inv" -n "$lines" --no-pager -o cat 2>/dev/null || true)
+    fi
+    # Fall back to the plain across-history tail if the invocation ID is
+    # unavailable (no systemctl, unit never started, permission-scoped away).
     [ -n "$tail_text" ] || tail_text=$(journalctl -u "$unit" -n "$lines" --no-pager -o cat 2>/dev/null || true)
   fi
   [ -n "$tail_text" ] || tail_text="(no journal output available for ${unit} — is this running under systemd with journal access?)"
@@ -1038,9 +1047,15 @@ alert() {
       # verbose late-stage failure isn't truncated down to just its progress
       # output. Discord caps `content` at 2000; stay under 1900.
       local dbudget=$(( 1900 - ${#title} - 12 ))
-      [ "$dbudget" -lt 0 ] && dbudget=0
-      dtail=$tail_text
-      [ "${#dtail}" -gt "$dbudget" ] && dtail=${dtail: -dbudget}
+      # Only tail when the budget is positive: `${dtail: -0}` would return the
+      # WHOLE excerpt (offset 0), which the head-clamp below could then chop,
+      # dropping the failure line. A non-positive budget (pathologically long
+      # title) → title-only alert instead.
+      dtail=""
+      if [ "$dbudget" -gt 0 ]; then
+        dtail=$tail_text
+        [ "${#dtail}" -gt "$dbudget" ] && dtail=${dtail: -dbudget}
+      fi
       # shellcheck disable=SC2016  # single quotes are intentional: this is a printf FORMAT string — %s are consumed by printf and the backticks must stay literal (double quotes would command-substitute them)
       dmsg=$(printf '%s\n```\n%s\n```' "$title" "$dtail")
       dmsg=${dmsg:0:1900}
@@ -1085,9 +1100,12 @@ alert() {
       # Keep the TAIL of the journal excerpt (same rationale as Discord), leaving
       # room for the title. Telegram caps `text` at 4096; stay under 3900.
       local tbudget=$(( 3900 - ${#title} - 6 ))
-      [ "$tbudget" -lt 0 ] && tbudget=0
-      ttail=$tail_text
-      [ "${#ttail}" -gt "$tbudget" ] && ttail=${ttail: -tbudget}
+      # Same positive-budget guard as Discord (avoid the `${ttail: -0}` whole-string trap).
+      ttail=""
+      if [ "$tbudget" -gt 0 ]; then
+        ttail=$tail_text
+        [ "${#ttail}" -gt "$tbudget" ] && ttail=${ttail: -tbudget}
+      fi
       tmsg=$(printf '%s\n\n%s' "$title" "$ttail")
       tmsg=${tmsg:0:3900}
       # Strip CR/LF from the token before interpolating it into the single-line
