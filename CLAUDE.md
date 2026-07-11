@@ -126,11 +126,14 @@ There is no linter configured; if changing the script, validate manually with
   (`$LOG_FILE`, which every non-alert run mirrors via `tee`), sliced from the LAST `Run started
   at …` header to EOF — so it's exactly the run that just failed, with no systemd-journal coupling
   (no `--invocation` version gate, no post-exit `InvocationID` lookup, no `systemd-journal`
-  read permission) and no bleed from a prior successful run. The block is only trusted if it
-  contains the `Run FAILED during stage: …` marker (the EXIT trap writes it on any non-zero exit);
-  if absent — a stale prior block (log unwritable by the run) or a run killed before the trap
-  (SIGKILL/OOM) — it's discarded. A plain `journalctl -u <unit>` tail is the **fallback** for those
-  missing/empty/stale cases, so the alert still reports the failed run, not the wrong one. The
+  read permission) and no bleed from a prior successful run. The block is trusted only if THIS
+  failure just wrote it — **both** the file mtime is fresh (within `ALERT_LOG_MAX_AGE_SECS`, default
+  300s) **and** the block carries the `Run FAILED during stage: …` marker (the EXIT trap writes it
+  on any non-zero exit). Freshness catches a stale block from a log the run could no longer append
+  to — even one that ended in an *earlier* `Run FAILED` (the marker alone can't tell that apart);
+  the marker catches a fresh-but-incomplete block from a run killed before the trap (SIGKILL/OOM).
+  Either miss → a plain `journalctl -u <unit>` tail **fallback**, so the alert always reports the
+  current failed run, never a stale one. The
   per-destination char-cap truncation keeps the **tail** of the excerpt (not the head),
   so the `Run FAILED during stage: …` line — always last — survives even a verbose late-stage
   failure. (Both truncations only tail when the char budget is positive, so a pathologically long

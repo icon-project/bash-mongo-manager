@@ -1008,16 +1008,27 @@ alert() {
   local lines="${ALERT_JOURNAL_LINES:-40}"
   local tail_text=""
   if [ -r "$LOG_FILE" ]; then
-    tail_text=$(awk '/^Run started at /{buf=""} {buf=buf $0 ORS} END{printf "%s", buf}' "$LOG_FILE" 2>/dev/null | tail -n "$lines")
-    # Only trust the block if it's actually *this* failure. The EXIT trap writes
-    # "Run FAILED during stage: …" on every non-zero exit, so its absence means the
-    # current failure isn't in the log — a stale prior block (log readable but not
-    # writable by the run) or a run killed before the trap (SIGKILL/OOM). Discard
-    # it so the journal fallback runs, preserving the report-the-failed-run behavior.
-    case "$tail_text" in
-      *"Run FAILED during stage"*) : ;;   # the failed run's own block — use it
-      *) tail_text="" ;;                    # stale/incomplete — fall through to the journal
-    esac
+    # Trust the log only if THIS failure just wrote it — two signals, both required:
+    #   (1) Freshness: the file was modified within ALERT_LOG_MAX_AGE_SECS (default
+    #       300s) of now. A block the run could no longer append to (read-only /
+    #       permission-broken / rotated-away log) keeps an OLD mtime — even when that
+    #       stale block itself ended in an *earlier* "Run FAILED", so the marker
+    #       alone (below) isn't enough to tell it apart from the current failure.
+    #   (2) Marker: the last block carries "Run FAILED during stage: …", which the
+    #       EXIT trap writes on every non-zero exit (a fresh but markerless block =
+    #       a run killed before the trap, e.g. SIGKILL/OOM).
+    # Either miss → discard and fall through to the journal, so the alert always
+    # reports the current failed run, never a stale one.
+    local max_age="${ALERT_LOG_MAX_AGE_SECS:-300}" now_epoch mtime_epoch
+    now_epoch=$(date +%s 2>/dev/null || echo 0)
+    mtime_epoch=$(stat -c %Y "$LOG_FILE" 2>/dev/null || stat -f %m "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$now_epoch" -gt 0 ] && [ "$mtime_epoch" -gt 0 ] && [ "$(( now_epoch - mtime_epoch ))" -le "$max_age" ]; then
+      tail_text=$(awk '/^Run started at /{buf=""} {buf=buf $0 ORS} END{printf "%s", buf}' "$LOG_FILE" 2>/dev/null | tail -n "$lines")
+      case "$tail_text" in
+        *"Run FAILED during stage"*) : ;;   # fresh + the failed run's own block — use it
+        *) tail_text="" ;;                    # fresh but markerless (killed pre-trap) — fall back
+      esac
+    fi
   fi
   # Fallback: if the run log is missing/empty/stale (e.g. a SIGKILL/OOM before the
   # run could write, an unwritable log, or a misconfigured path), fall back to a
