@@ -1028,7 +1028,12 @@ alert() {
       # multi-user host for the curl process's lifetime. The -d payload is just
       # the journal tail (not secret) so it stays on argv. Output is discarded so
       # nothing leaks into the log. -f fails on HTTP errors, -m bounds the hang.
-      if printf 'url = %s\n' "$DISCORD_WEBHOOK_URL" \
+      # Strip any CR/LF from the URL first: a newline would let a crafted or
+      # fat-fingered value inject extra directives into the single-line curl
+      # config (the .env loader strips CR, but a multi-line quoted value or an
+      # env-provided one could still carry a newline).
+      local hook_url="${DISCORD_WEBHOOK_URL//$'\r'/}"; hook_url="${hook_url//$'\n'/}"
+      if printf 'url = %s\n' "$hook_url" \
          | curl -fsS -m 15 -K - -X POST -H "Content-Type: application/json" \
            -d "$payload" >/dev/null 2>&1; then
         echo "Failure alert sent to Discord."
@@ -1053,7 +1058,11 @@ alert() {
       local tmsg
       tmsg=$(printf '%s\n\n%s' "$title" "$tail_text")
       tmsg=${tmsg:0:3900}
-      if printf 'url = https://api.telegram.org/bot%s/sendMessage\n' "$TELEGRAM_BOT_TOKEN" \
+      # Strip CR/LF from the token before interpolating it into the single-line
+      # curl config, so a stray newline can't inject extra curl directives (same
+      # reasoning as the Discord webhook URL above).
+      local bot_token="${TELEGRAM_BOT_TOKEN//$'\r'/}"; bot_token="${bot_token//$'\n'/}"
+      if printf 'url = https://api.telegram.org/bot%s/sendMessage\n' "$bot_token" \
          | curl -fsS -m 15 -K - -X POST \
            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
            --data-urlencode "text=${tmsg}" >/dev/null 2>&1; then
