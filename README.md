@@ -322,7 +322,7 @@ An unattended `backup` runs under `set -e` and exits non-zero the moment **eithe
    sudo cp systemd/mongo-backup-alert.service /etc/systemd/system/
    sudo systemctl daemon-reload
    ```
-   Edit its `WorkingDirectory`/`ExecStart` to match `mongo-backup.service`. It runs as **root** so it can read the system unit's journal and the backup's `.env`.
+   Edit its `WorkingDirectory`/`ExecStart`/`User`/`Group` to match `mongo-backup.service`. It runs as the **same unprivileged user** as the backup (not root) — the script `source`s `.env`, so running as root while `.env` is writable by the backup user would be a local privilege-escalation vector. Reading the backup unit's journal as that non-root user requires adding it to the `systemd-journal` group: `sudo usermod -aG systemd-journal youruser`. (As a backstop, the script also refuses to source a non-root-owned or group/world-writable `.env` when it is run as root.)
 2. Enable alerting in the **same `.env`** the backup uses (real values live only on the host — **never commit them**):
    ```bash
    USE_ALERTS=true

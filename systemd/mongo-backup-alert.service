@@ -28,13 +28,20 @@ Description=Send a failure alert for mongo-backup.service (Discord/Telegram)
 Type=oneshot
 
 # --- EDIT THESE TO MATCH mongo-backup.service --------------------------------
-# No User=/Group= is set, so this runs as root. That's deliberate: reading a
-# *system* unit's journal (`journalctl -u mongo-backup.service`) needs privilege,
-# and root can also read the backup's .env for the alert secrets. If you instead
-# run it as a non-root user, that user must be in the `systemd-journal` group and
-# able to read the .env. (The `alert` command deliberately skips the script's
-# on-disk log so this root run can't create logs/ root-owned and lock the
-# unprivileged backup out of its own log — alert output goes to the journal.)
+# Run as the SAME unprivileged user as mongo-backup.service — NOT root. The
+# script `source`s .env (which executes it), so running as root while .env is
+# writable by the backup user would be a local privilege-escalation vector
+# (editing .env → arbitrary root code). Running as the same non-root user that
+# owns .env removes that boundary entirely. (The script also refuses to source a
+# non-root-owned / group-writable .env when it *is* run as root, as a backstop.)
+#
+# Reading another unit's journal (`journalctl -u mongo-backup.service`) as a
+# non-root user requires membership in the `systemd-journal` group:
+#   sudo usermod -aG systemd-journal youruser
+# The alert command skips the script's on-disk log (output goes to the journal),
+# so it needs no write access to the backups/logs directory.
+User=youruser
+Group=youruser
 WorkingDirectory=/opt/mongo-backup
 ExecStart=/opt/mongo-backup/mongo_backup_manager.sh alert mongo-backup.service
 # -----------------------------------------------------------------------------

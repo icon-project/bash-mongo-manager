@@ -85,6 +85,24 @@ if [ -f "$ENV_FILE" ]; then
     echo "Error: $ENV_FILE exists but is not readable by user '$(id -un)'." >&2
     exit 1
   fi
+  # If we're running as root, refuse to `source` a .env that a non-root user
+  # could have written: sourcing EXECUTES the file, so a non-root-owned or
+  # group/other-writable .env would let that user inject arbitrary code that then
+  # runs as root — a local privilege escalation. (This matters most for the
+  # OnFailure alert path if it's configured to run as root; the shipped unit runs
+  # as the unprivileged backup user instead.) Require root-owned and not
+  # group/other-writable; the fix is a one-liner shown in the message.
+  if [ "$(id -u)" -eq 0 ]; then
+    env_uid=$(stat -c '%u' "$ENV_FILE" 2>/dev/null || stat -f '%u' "$ENV_FILE" 2>/dev/null || echo "")
+    env_perm=$(stat -c '%a' "$ENV_FILE" 2>/dev/null || stat -f '%Lp' "$ENV_FILE" 2>/dev/null || echo "")
+    if [ "$env_uid" != "0" ] || { [ -n "$env_perm" ] && [ $(( 8#$env_perm & 022 )) -ne 0 ]; }; then
+      echo "Error: refusing to source $ENV_FILE as root — it must be root-owned and not group/other-writable" >&2
+      echo "       (owner uid=${env_uid:-unknown}, perms=${env_perm:-unknown}). Sourcing executes the file, so a" >&2
+      echo "       non-root-writable .env would run as root (privilege escalation)." >&2
+      echo "       Fix: sudo chown root:root '$ENV_FILE' && sudo chmod 600 '$ENV_FILE'  — or run as the non-root backup user." >&2
+      exit 1
+    fi
+  fi
   set -a
   # Source with carriage returns stripped so a .env saved with Windows (CRLF)
   # line endings can't break us. Stripping at source time (not after) is what

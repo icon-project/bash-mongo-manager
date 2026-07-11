@@ -123,7 +123,11 @@ There is no linter configured; if changing the script, validate manually with
 - **Failure alerting**: `mongo-backup.service` has `OnFailure=mongo-backup-alert.service`; that
   companion oneshot runs `mongo_backup_manager.sh alert mongo-backup.service`, which tails the
   failed unit's journal (`journalctl -u … -o cat`) and posts it to Discord and/or Telegram.
-  It runs as **root** (needs privilege to read a system unit's journal + the backup's `.env`).
+  It runs as the **same unprivileged user** as the backup (in the `systemd-journal` group so it
+  can read the unit journal), **not root** — the script `source`s `.env`, so a root alert + a
+  backup-user-writable `.env` would be a local privilege escalation. As a backstop the script
+  refuses to source a non-root-owned or group/other-writable `.env` when it *is* run as root
+  (`id -u`==0 check before the `source`).
   A **stage marker** makes the alert unambiguous: `stage "<name>"` sets a global `CURRENT_STAGE`
   and echoes `>>> STAGE: <name>` into the log/journal at each backup transition (mongodump →
   copy → S3 upload → S3 prune → local prune → resolve container); the `log_run_end` EXIT trap
