@@ -1009,10 +1009,19 @@ alert() {
   local tail_text=""
   if [ -r "$LOG_FILE" ]; then
     tail_text=$(awk '/^Run started at /{buf=""} {buf=buf $0 ORS} END{printf "%s", buf}' "$LOG_FILE" 2>/dev/null | tail -n "$lines")
+    # Only trust the block if it's actually *this* failure. The EXIT trap writes
+    # "Run FAILED during stage: …" on every non-zero exit, so its absence means the
+    # current failure isn't in the log — a stale prior block (log readable but not
+    # writable by the run) or a run killed before the trap (SIGKILL/OOM). Discard
+    # it so the journal fallback runs, preserving the report-the-failed-run behavior.
+    case "$tail_text" in
+      *"Run FAILED during stage"*) : ;;   # the failed run's own block — use it
+      *) tail_text="" ;;                    # stale/incomplete — fall through to the journal
+    esac
   fi
-  # Fallback: if the run log is missing/empty (e.g. a SIGKILL/OOM before the run
-  # could write, or a misconfigured path), fall back to a plain journal tail so we
-  # still send *something* rather than staying silent.
+  # Fallback: if the run log is missing/empty/stale (e.g. a SIGKILL/OOM before the
+  # run could write, an unwritable log, or a misconfigured path), fall back to a
+  # plain journal tail so we still report the failed run rather than the wrong one.
   if [ -z "$tail_text" ] && command -v journalctl >/dev/null 2>&1; then
     tail_text=$(journalctl -u "$unit" -n "$lines" --no-pager -o cat 2>/dev/null || true)
   fi
