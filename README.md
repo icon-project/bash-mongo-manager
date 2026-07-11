@@ -270,7 +270,7 @@ The `backup` command runs to completion and exits non-zero on failure, so it sch
 Ready-to-edit unit files live in [`systemd/`](systemd/). They run `backup` on a schedule, order after Docker and the network, and send output to the journal.
 
 1. Put the script somewhere stable (e.g. `/opt/mongo-backup`) with its `.env` beside it, then edit the marked lines in `systemd/mongo-backup.service` — `User`/`Group`, `WorkingDirectory`, and `ExecStart` — so they point at that location and at a user who can reach Docker and your AWS profile.
-2. Install and enable. Copy the alert unit too — `mongo-backup.service` references it via `OnFailure=`, so if it isn't installed a *failed* backup logs a secondary "unit not found" error (see [Failure alerting](#failure-alerting); it stays a harmless no-op until you set `USE_ALERTS=true`). If you don't want alerting at all, remove the `OnFailure=` line from `mongo-backup.service` instead.
+2. Install and enable. Copy the alert unit too and edit its placeholders — `mongo-backup.service` references it via `OnFailure=`, so if it isn't installed (or is left with the placeholder `User=youruser`/paths) a *failed* backup adds a confusing secondary error. Once it's installed and configured it's a no-op until you set `USE_ALERTS=true` (see [Failure alerting](#failure-alerting)). If you don't want alerting at all, remove the `OnFailure=` line from `mongo-backup.service` instead.
    ```bash
    sudo cp systemd/mongo-backup.{service,timer} systemd/mongo-backup-alert.service /etc/systemd/system/
    sudo systemctl daemon-reload
@@ -315,7 +315,7 @@ For defence-in-depth you can *also* add an S3 **lifecycle rule** on the `mongodb
 
 An unattended `backup` runs under `set -e` and exits non-zero the moment **either** the `mongodump` **or** the `aws s3 cp` upload fails, so a single systemd `OnFailure=` hook catches both. The companion unit [`systemd/mongo-backup-alert.service`](systemd/mongo-backup-alert.service) is a `oneshot` that runs `mongo_backup_manager.sh alert mongo-backup.service`: it tails the failed run's journal — which carries `>>> STAGE: …` markers and a `Run FAILED during stage: …` line — and posts it to Discord and/or Telegram, so the alert tells you **which stage** died (mongodump vs the S3 upload vs a prune), not merely that the backup failed.
 
-`mongo-backup.service` already ships with `OnFailure=mongo-backup-alert.service` enabled. Alerting stays dormant (the alert unit is a harmless no-op) until you opt in:
+`mongo-backup.service` already ships with `OnFailure=mongo-backup-alert.service` enabled. Once the alert unit is **installed and its placeholders are edited** (step 1 below), alerting stays dormant — a backup failure starts the alert unit, which just logs "alerting disabled" and exits 0 — until you set `USE_ALERTS=true`. Note the no-op only holds in that installed-and-configured state: if the alert unit is missing, or copied but left with the placeholder `User=youruser`/paths, a backup failure will make `OnFailure=` itself error (secondary "unit not found" or a failed start) on top of the real failure. To opt in:
 
 1. Install the alert unit next to the backup units:
    ```bash

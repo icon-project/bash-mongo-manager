@@ -129,10 +129,13 @@ There is no linter configured; if changing the script, validate manually with
   refuses to source a non-root-owned or group/other-writable `.env` when it *is* run as root
   (`id -u`==0 check before the `source`).
   A **stage marker** makes the alert unambiguous: `stage "<name>"` sets a global `CURRENT_STAGE`
-  and echoes `>>> STAGE: <name>` into the log/journal at each backup transition (mongodump →
-  copy → S3 upload → S3 prune → local prune → resolve container); the `log_run_end` EXIT trap
-  prints `Run FAILED during stage: <CURRENT_STAGE>` on a non-zero exit, so the journal tail the
-  alert forwards names the culprit. The `alert` command is **best-effort by contract**: it never
+  and echoes `>>> STAGE: <name>` into the log/journal at each transition. The dispatcher runs
+  `resolve container` first (shared by backup/restore/verify); then each command advances it —
+  backup: `prepare dump → mongodump → copy dump to host → S3 upload → S3 prune → local prune`;
+  restore: `restore preflight → copy archive to container → mongorestore`; verify: `verify`. The
+  `log_run_end` EXIT trap prints `Run FAILED during stage: <CURRENT_STAGE>` on a non-zero exit,
+  so the journal tail the alert forwards names the culprit (every path advances past
+  `resolve container`, so a failure is never misattributed to name resolution). The `alert` command is **best-effort by contract**: it never
   runs `health_check`/`resolve_container` (it fires *because* the backup broke, maybe because the
   container is gone), each destination is attempted independently, a failed send only warns, and
   it **always returns 0** — an alert hiccup must not add a scary secondary failure. Secrets are
