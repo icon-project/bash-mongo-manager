@@ -302,7 +302,13 @@ json_escape_body() {
   s=${s//$'\t'/\\t}
   s=${s//$'\r'/\\r}
   s=${s//$'\n'/\\n}
-  printf '%s' "$s"
+  # JSON forbids raw control characters (0x00–0x1F) inside a string. The
+  # substitutions above turned tab/CR/LF into escape sequences; strip any *other*
+  # control bytes that might appear in the journal tail (e.g. ESC 0x1b from
+  # ANSI-colored output) so this no-jq fallback still produces valid JSON and the
+  # Discord POST doesn't fail. Best-effort alert → drop the noise rather than
+  # \u-escaping it. (The jq path handles these correctly on its own.)
+  printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037'
 }
 
 # Resolve CONTAINER_NAME to the single running container it names, then rewrite
