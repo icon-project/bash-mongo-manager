@@ -165,6 +165,15 @@ health_check() {
       echo "       Set DISCORD_WEBHOOK_URL and/or TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env, or set USE_ALERTS=false."
       exit 1
     fi
+    # A configured destination is useless without curl to POST to it: alert()
+    # would only warn and return 0, leaving scheduled backups with a silently
+    # nonfunctional safety net discovered only after a real failure. Since both
+    # transports need curl, require it here so the misconfig is caught up front.
+    if ! command -v curl >/dev/null 2>&1; then
+      echo "Error: USE_ALERTS=true with a configured destination, but 'curl' is not on PATH — alerts could not be sent."
+      echo "       Install curl on the backup host (and ensure it's on the systemd unit's PATH), or set USE_ALERTS=false."
+      exit 1
+    fi
   fi
 
   # Check if each variable is set
@@ -357,6 +366,13 @@ backup() {
   fi
 
   echo "Starting MongoDB backup at $TIMESTAMP..."
+
+  # Mark the pre-dump work (including the collection-listing mongosh preflight
+  # below) so that if it fails under `set -e` — bad Mongo auth, or a
+  # multi-collection request without mongosh — the failure alert attributes it to
+  # this step instead of the stale "resolve container" stage. The actual dump
+  # re-stamps the stage to "mongodump" just before running mongodump.
+  stage "prepare dump"
 
   mkdir -p "$BACKUP_DIR"
 
