@@ -1,7 +1,8 @@
 # mongo-backup.service — run one MongoDB backup to completion.
 #
-# Install:
-#   sudo cp systemd/mongo-backup.{service,timer} /etc/systemd/system/
+# Install (copy the alert unit too — this service references it via OnFailure=,
+# so it must exist or a failed backup logs a secondary "unit not found" error):
+#   sudo cp systemd/mongo-backup.{service,timer} systemd/mongo-backup-alert.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now mongo-backup.timer   # schedule it
 #   sudo systemctl start mongo-backup.service        # or run once, now
@@ -16,9 +17,19 @@ Description=MongoDB backup via mongo_backup_manager.sh
 # Wants (not Requires) keeps this portable if your Docker unit has another name.
 Wants=network-online.target docker.service
 After=network-online.target docker.service
-# Optional: notify on failure. Create mongo-backup-alert.service first (a
-# oneshot that curls a Slack/webhook), then uncomment:
-# OnFailure=mongo-backup-alert.service
+# On any non-zero exit (failed mongodump OR failed S3 upload — the script runs
+# under `set -e`), start the companion alert unit, which posts this run's journal
+# tail to Discord/Telegram.
+#
+# For this to be a clean no-op until you opt in, mongo-backup-alert.service must
+# be INSTALLED and have its placeholders (User/Group/WorkingDirectory/ExecStart)
+# edited to match this unit (see the Install block above). In that state, with
+# USE_ALERTS=false the alert command just logs "alerting disabled" and exits 0.
+# If instead the alert unit is missing, or still has the unedited `User=youruser`
+# placeholder, this OnFailure= will itself fail to start on a backup failure and
+# add a confusing secondary error on top of the real one. So: install + configure
+# the alert unit, or remove this line if you don't want alerting at all.
+OnFailure=mongo-backup-alert.service
 
 [Service]
 Type=oneshot

@@ -11,6 +11,8 @@ This script automates the process of backing up a MongoDB database running in a 
 - Automatically cleans up old backups from the local directory (optional).
 - Restores a backup to the MongoDB database.
 - Verifies count and full index-spec parity between two namespaces after a restore/migration.
+- Resolves the target container by exact name **or** a stable name prefix, so it survives orchestrators (e.g. Coolify) that regenerate the container name on every redeploy.
+- Alerts on failure (Discord/Telegram) for unattended runs, naming the stage that failed (mongodump vs S3 upload).
 ---
 
 ## Prerequisites
@@ -65,11 +67,15 @@ Ensure the IAM user associated with the AWS credentials has the correct permissi
 
 ## Environment Variables.
 
-Create a `.env` file in the same directory as the script and add the following environment variables:
+Create a `.env` file in the same directory as the script and add the following environment variables. A ready-to-copy template lives in [`.env-example`](.env-example):
+
+```bash
+cp .env-example .env   # then edit in your real values
+```
 
 ```bash
 # Set variables
-CONTAINER_NAME="name-of-your-mongo-container"
+CONTAINER_NAME="sodax-stateful-mongo"   # exact name OR a stable name prefix (see below)
 S3_BUCKET_NAME="name-of-your-s3-bucket"
 MONGO_PORT="27017"
 MONGO_USER="user"
@@ -77,10 +83,11 @@ MONGO_PASSWORD="password"
 MONGO_DB_NAME="test"
 USE_CREDENTIALS="true" # set to false if the DB has no auth
 USE_REMOTE="false"     # set to true to enable S3 upload/download/list/prune
+USE_ALERTS="false"     # set to true to alert (Discord/Telegram) when a run fails
 ```
 | Variable           | Description                                                                |
 |--------------------|----------------------------------------------------------------------------|
-| `CONTAINER_NAME`   | Name of the MongoDB container.                                             |
+| `CONTAINER_NAME`   | The MongoDB container: either its **exact name** or a **stable name prefix**. A prefix is resolved at run time (via `docker ps`, running containers only) to the single live match, and must resolve to exactly one — 0 or >1 matches is a hard error. See "Dynamic container-name resolution" below.|
 | `S3_BUCKET_NAME`   | Name of the AWS S3 bucket where backups will be stored (required only when `USE_REMOTE=true`).                   |
 | `MONGO_PORT`       | Port number of the MongoDB instance.|
 | `MONGO_USER`       | MongoDB username (required only when `USE_CREDENTIALS=true`).|
@@ -89,6 +96,14 @@ USE_REMOTE="false"     # set to true to enable S3 upload/download/list/prune
 | `USE_CREDENTIALS`  | When `false`, skips MongoDB username/password in dump/restore commands. Defaults to `true`.|
 | `USE_REMOTE`       | When `true`, enables S3 upload/download/list/prune. Defaults to `false` (local-only); set `true` to use S3.|
 | `S3_RETENTION_DAYS`| Days after which S3 backups are pruned. Defaults to `7`. `0` skips the S3 prune entirely so an S3 lifecycle rule owns retention. Must be a non-negative integer (validated when `USE_REMOTE=true`). Only affects S3 — the local disk prune is always 7 days.|
+| `USE_ALERTS`       | When `true`, enables failure alerting (see "Failure alerting" below). Defaults to `false`. Requires at least one destination below; validated in `health_check`.|
+| `DISCORD_WEBHOOK_URL` | Discord webhook URL to post a failure alert to (required for Discord alerts when `USE_ALERTS=true`). **Secret — never commit.**|
+| `TELEGRAM_BOT_TOKEN`  | Telegram bot token from `@BotFather` (required, together with `TELEGRAM_CHAT_ID`, for Telegram alerts when `USE_ALERTS=true`). **Secret — never commit.**|
+| `TELEGRAM_CHAT_ID`    | Telegram chat/channel id to send the alert to (required together with `TELEGRAM_BOT_TOKEN`).|
+
+### Dynamic container-name resolution
+
+`CONTAINER_NAME` may be an **exact** container name (backward-compatible — it's the sole match) or a **stable name prefix**. This matters on platforms like **Coolify**, which regenerate the container's full name (e.g. `sodax-stateful-mongo-<stackhash>-<timestamp>`) on every redeploy — a hard-coded full name would silently break every `docker exec`/`docker cp` after the first redeploy. Set `CONTAINER_NAME` to the stable prefix (e.g. `sodax-stateful-mongo`) and the script resolves it to the one running container at run time (once per run, shared by `backup`/`restore`/`verify`). If the prefix matches **no** running container (nothing up) or **more than one** (ambiguous), the run aborts with a clear error instead of guessing.
 
 > If your `.env` is saved with Windows (CRLF) line endings, the script strips the trailing carriage return from these values automatically, so a stray `\r` won't break the container name, port, or S3 path. Only the CR is removed — other whitespace (e.g. inside a password) is preserved as-is.
 
@@ -255,9 +270,9 @@ The `backup` command runs to completion and exits non-zero on failure, so it sch
 Ready-to-edit unit files live in [`systemd/`](systemd/). They run `backup` on a schedule, order after Docker and the network, and send output to the journal.
 
 1. Put the script somewhere stable (e.g. `/opt/mongo-backup`) with its `.env` beside it, then edit the marked lines in `systemd/mongo-backup.service` — `User`/`Group`, `WorkingDirectory`, and `ExecStart` — so they point at that location and at a user who can reach Docker and your AWS profile.
-2. Install and enable:
+2. Install and enable. Copy the alert unit too and edit its placeholders — `mongo-backup.service` references it via `OnFailure=`, so if it isn't installed (or is left with the placeholder `User=youruser`/paths) a *failed* backup adds a confusing secondary error. Once it's installed and configured it's a no-op until you set `USE_ALERTS=true` (see [Failure alerting](#failure-alerting)). If you don't want alerting at all, remove the `OnFailure=` line from `mongo-backup.service` instead.
    ```bash
-   sudo cp systemd/mongo-backup.{service,timer} /etc/systemd/system/
+   sudo cp systemd/mongo-backup.{service,timer} systemd/mongo-backup-alert.service /etc/systemd/system/
    sudo systemctl daemon-reload
    sudo systemctl enable --now mongo-backup.timer
    ```
@@ -295,3 +310,33 @@ Every `backup` run prunes old backups from **both** locations:
 For defence-in-depth you can *also* add an S3 **lifecycle rule** on the `mongodb-backups/` prefix to expire (or transition to Glacier) old objects, so retention still happens even if a scheduled run is skipped for a long stretch.
 
 **Letting a lifecycle policy own S3 retention:** set `S3_RETENTION_DAYS=0` to skip the tool's S3 prune entirely and make an S3 lifecycle rule the single source of truth for how long backups live. Without this, the tool's prune competes with the lifecycle rule — e.g. a 30-day lifecycle rule never sees anything older than 7 days because the tool already deleted it on the previous run. Use `0` when you want longer (or tiered) S3 retention managed by the bucket, and keep the default `7` when you want the tool to handle it.
+
+### Failure alerting
+
+An unattended `backup` runs under `set -e` and exits non-zero the moment **either** the `mongodump` **or** the `aws s3 cp` upload fails, so a single systemd `OnFailure=` hook catches both. The companion unit [`systemd/mongo-backup-alert.service`](systemd/mongo-backup-alert.service) is a `oneshot` that runs `mongo_backup_manager.sh alert mongo-backup.service`: it tails the failed run's journal — which carries `>>> STAGE: …` markers and a `Run FAILED during stage: …` line — and posts it to Discord and/or Telegram, so the alert tells you **which stage** died (mongodump vs the S3 upload vs a prune), not merely that the backup failed.
+
+`mongo-backup.service` already ships with `OnFailure=mongo-backup-alert.service` enabled. Once the alert unit is **installed and its placeholders are edited** (step 1 below), alerting stays dormant — a backup failure starts the alert unit, which just logs "alerting disabled" and exits 0 — until you set `USE_ALERTS=true`. Note the no-op only holds in that installed-and-configured state: if the alert unit is missing, or copied but left with the placeholder `User=youruser`/paths, a backup failure will make `OnFailure=` itself error (secondary "unit not found" or a failed start) on top of the real failure. To opt in:
+
+1. Install the alert unit next to the backup units:
+   ```bash
+   sudo cp systemd/mongo-backup-alert.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   ```
+   Edit its `WorkingDirectory`/`ExecStart`/`User`/`Group` to match `mongo-backup.service`. It runs as the **same unprivileged user** as the backup (not root) — the script `source`s `.env`, so running as root while `.env` is writable by the backup user would be a local privilege-escalation vector. Reading the backup unit's journal as that non-root user requires adding it to the `systemd-journal` group: `sudo usermod -aG systemd-journal youruser`. (As a backstop, the script also refuses to source a non-root-owned or group/world-writable `.env` when it is run as root.)
+2. Enable alerting in the **same `.env`** the backup uses (real values live only on the host — **never commit them**):
+   ```bash
+   USE_ALERTS=true
+   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>   # and/or
+   TELEGRAM_BOT_TOKEN=123456:AA...
+   TELEGRAM_CHAT_ID=-1001234567890
+   ```
+   Configure Discord, Telegram, or both. `health_check` validates the config when `USE_ALERTS=true`: it rejects a half-configured Telegram (only one of the two vars) and rejects `USE_ALERTS=true` with no destination at all, so a typo can't silently leave you with no safety net.
+3. Test it (posts a "no journal output" style message when the backup unit hasn't actually failed):
+   ```bash
+   sudo systemctl start mongo-backup-alert.service
+   journalctl -u mongo-backup-alert.service -e
+   ```
+
+Alerting is **best-effort**: a failed webhook/API call warns but never changes the run's exit status or masks the real backup failure (which systemd has already recorded), and each destination is attempted independently so one being down doesn't suppress the other. To opt out entirely, leave `USE_ALERTS=false` (the default) or remove the `OnFailure=` line from `mongo-backup.service`.
+
+> **Out of scope:** this only alerts on a run that *ran and failed*. A run that never fired (cron/box down) can't alert on itself — that "did it even run?" freshness check belongs in an external watcher, tracked separately.
