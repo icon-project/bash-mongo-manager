@@ -244,6 +244,7 @@ fi
 
 # Helper: build mongo auth args as an array (prevents shell-quoting issues)
 build_mongo_auth_args() {
+  # shellcheck disable=SC2178  # _out is a nameref to an array; the string assignment is the ref target, not a value
   local -n _out=$1
   _out=()
   if [ "$USE_CREDENTIALS" != "false" ]; then
@@ -257,6 +258,7 @@ build_mongo_auth_args() {
 # Names are not trimmed: a leading/trailing space is part of the name, so the
 # list must not contain spaces around the commas.
 split_csv() {
+  # shellcheck disable=SC2178  # _csv_out is a nameref to an array; the string assignment is the ref target, not a value
   local -n _csv_out=$1
   _csv_out=()
   local IFS=',' _field
@@ -273,6 +275,7 @@ split_csv() {
 # Helper: build mongosh auth args as an array. mongosh uses space-separated
 # flags (its CLI parser differs from mongodump/mongorestore which accept --flag=val).
 build_mongosh_auth_args() {
+  # shellcheck disable=SC2178  # _out is a nameref to an array; the string assignment is the ref target, not a value
   local -n _out=$1
   _out=()
   if [ "$USE_CREDENTIALS" != "false" ]; then
@@ -663,7 +666,6 @@ restore() {
   #   * a bare filename is looked up in the script's own backup dirs — the form
   #     `download_backup` prints.
   if [ ! -e "$RESTORE_FILE" ]; then
-    local cand
     case "$RESTORE_FILE" in
       /*) : ;;                                             # absolute + missing -> fail fast
       */*) [ -e "${SCRIPT_DIR}/${RESTORE_FILE}" ] && RESTORE_FILE="${SCRIPT_DIR}/${RESTORE_FILE}" ;;
@@ -1025,6 +1027,7 @@ alert() {
       # aborting under `set -e` — this function must stay best-effort and reach its
       # `return 0`, or the OnFailure notifier would itself fail noisily.
       local dmsg payload
+      # shellcheck disable=SC2016  # single quotes are intentional: this is a printf FORMAT string — %s are consumed by printf and the backticks must stay literal (double quotes would command-substitute them)
       dmsg=$(printf '%s\n```\n%s\n```' "$title" "$tail_text")
       dmsg=${dmsg:0:1900}
       if command -v jq >/dev/null 2>&1 && payload=$(printf '%s' "$dmsg" | jq -Rs '{content: .}' 2>/dev/null); then
