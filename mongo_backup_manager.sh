@@ -990,10 +990,14 @@ alert() {
       else
         payload=$(printf '{"content":"%s"}' "$(json_escape_body "$dmsg")")
       fi
-      # Discard curl output entirely so the webhook URL can never leak; report
-      # only pass/fail. -f fails on HTTP errors, -m bounds the hang.
-      if curl -fsS -m 15 -X POST -H "Content-Type: application/json" \
-           -d "$payload" "$DISCORD_WEBHOOK_URL" >/dev/null 2>&1; then
+      # Pass the webhook URL via a curl config on stdin (-K -) instead of as an
+      # argv argument, so the secret can't be read from `ps`/`/proc` on a
+      # multi-user host for the curl process's lifetime. The -d payload is just
+      # the journal tail (not secret) so it stays on argv. Output is discarded so
+      # nothing leaks into the log. -f fails on HTTP errors, -m bounds the hang.
+      if printf 'url = %s\n' "$DISCORD_WEBHOOK_URL" \
+         | curl -fsS -m 15 -K - -X POST -H "Content-Type: application/json" \
+           -d "$payload" >/dev/null 2>&1; then
         echo "Failure alert sent to Discord."
       else
         echo "Warning: Discord alert failed to send." >&2
@@ -1008,15 +1012,18 @@ alert() {
     any_dest=1
     if command -v curl >/dev/null 2>&1; then
       # Telegram caps `text` at 4096 chars. --data-urlencode lets curl handle all
-      # escaping, so no JSON building is needed. The bot token lives only in the
-      # URL and is never echoed (curl output is discarded).
+      # escaping, so no JSON building is needed. The bot token is a secret (it's
+      # embedded in the API URL), so pass the URL via a curl config on stdin
+      # (-K -) rather than as an argv argument — otherwise the token would be
+      # visible in `ps`/`/proc` on a multi-user host. chat_id is an identifier,
+      # not a credential, so it's fine on argv. curl output is discarded.
       local tmsg
       tmsg=$(printf '%s\n\n%s' "$title" "$tail_text")
       tmsg=${tmsg:0:3900}
-      if curl -fsS -m 15 -X POST \
+      if printf 'url = https://api.telegram.org/bot%s/sendMessage\n' "$TELEGRAM_BOT_TOKEN" \
+         | curl -fsS -m 15 -K - -X POST \
            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-           --data-urlencode "text=${tmsg}" \
-           "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >/dev/null 2>&1; then
+           --data-urlencode "text=${tmsg}" >/dev/null 2>&1; then
         echo "Failure alert sent to Telegram."
       else
         echo "Warning: Telegram alert failed to send." >&2

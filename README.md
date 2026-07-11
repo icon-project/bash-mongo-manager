@@ -270,9 +270,9 @@ The `backup` command runs to completion and exits non-zero on failure, so it sch
 Ready-to-edit unit files live in [`systemd/`](systemd/). They run `backup` on a schedule, order after Docker and the network, and send output to the journal.
 
 1. Put the script somewhere stable (e.g. `/opt/mongo-backup`) with its `.env` beside it, then edit the marked lines in `systemd/mongo-backup.service` — `User`/`Group`, `WorkingDirectory`, and `ExecStart` — so they point at that location and at a user who can reach Docker and your AWS profile.
-2. Install and enable:
+2. Install and enable. Copy the alert unit too — `mongo-backup.service` references it via `OnFailure=`, so if it isn't installed a *failed* backup logs a secondary "unit not found" error (see [Failure alerting](#failure-alerting); it stays a harmless no-op until you set `USE_ALERTS=true`). If you don't want alerting at all, remove the `OnFailure=` line from `mongo-backup.service` instead.
    ```bash
-   sudo cp systemd/mongo-backup.{service,timer} /etc/systemd/system/
+   sudo cp systemd/mongo-backup.{service,timer} systemd/mongo-backup-alert.service /etc/systemd/system/
    sudo systemctl daemon-reload
    sudo systemctl enable --now mongo-backup.timer
    ```

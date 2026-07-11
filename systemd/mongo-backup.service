@@ -1,7 +1,8 @@
 # mongo-backup.service — run one MongoDB backup to completion.
 #
-# Install:
-#   sudo cp systemd/mongo-backup.{service,timer} /etc/systemd/system/
+# Install (copy the alert unit too — this service references it via OnFailure=,
+# so it must exist or a failed backup logs a secondary "unit not found" error):
+#   sudo cp systemd/mongo-backup.{service,timer} systemd/mongo-backup-alert.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now mongo-backup.timer   # schedule it
 #   sudo systemctl start mongo-backup.service        # or run once, now
@@ -21,6 +22,9 @@ After=network-online.target docker.service
 # tail to Discord/Telegram. Alerting only actually sends when USE_ALERTS=true and
 # a destination is configured in .env; otherwise the alert unit is a harmless
 # no-op, so leaving this enabled is safe even before you wire up secrets.
+# NOTE: mongo-backup-alert.service must be installed (see the Install block above)
+# or this line produces a "unit not found" error when a backup fails. If you don't
+# want alerting at all, remove this line rather than leaving the unit uninstalled.
 OnFailure=mongo-backup-alert.service
 
 [Service]
