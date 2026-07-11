@@ -19,12 +19,16 @@ Wants=network-online.target docker.service
 After=network-online.target docker.service
 # On any non-zero exit (failed mongodump OR failed S3 upload — the script runs
 # under `set -e`), start the companion alert unit, which posts this run's journal
-# tail to Discord/Telegram. Alerting only actually sends when USE_ALERTS=true and
-# a destination is configured in .env; otherwise the alert unit is a harmless
-# no-op, so leaving this enabled is safe even before you wire up secrets.
-# NOTE: mongo-backup-alert.service must be installed (see the Install block above)
-# or this line produces a "unit not found" error when a backup fails. If you don't
-# want alerting at all, remove this line rather than leaving the unit uninstalled.
+# tail to Discord/Telegram.
+#
+# For this to be a clean no-op until you opt in, mongo-backup-alert.service must
+# be INSTALLED and have its placeholders (User/Group/WorkingDirectory/ExecStart)
+# edited to match this unit (see the Install block above). In that state, with
+# USE_ALERTS=false the alert command just logs "alerting disabled" and exits 0.
+# If instead the alert unit is missing, or still has the unedited `User=youruser`
+# placeholder, this OnFailure= will itself fail to start on a backup failure and
+# add a confusing secondary error on top of the real one. So: install + configure
+# the alert unit, or remove this line if you don't want alerting at all.
 OnFailure=mongo-backup-alert.service
 
 [Service]
