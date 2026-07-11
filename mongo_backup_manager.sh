@@ -190,7 +190,17 @@ S3_BACKUP_DIR_TEMP="${SCRIPT_DIR}/backups_temp"
 BACKUP_FILE_NAME="mongo_backup_${TIMESTAMP}.gz"
 BACKUP_FILE="${BACKUP_DIR}/${BACKUP_FILE_NAME}"
 if [ "$USE_REMOTE" != "false" ]; then
-  S3_BACKUP_PATH="s3://${S3_BUCKET_NAME}/mongodb-backups/"
+  # Use ${S3_BUCKET_NAME:-} (not a bare ${S3_BUCKET_NAME}) so this top-level line
+  # can't abort under `set -u` when USE_REMOTE=true but S3_BUCKET_NAME is unset.
+  # Two reasons: (1) health_check gives a friendly "S3_BUCKET_NAME is not set"
+  # message a few lines later — a bare ref would instead abort here with a cryptic
+  # "unbound variable" before health_check ever runs; (2) more importantly, this
+  # line runs for EVERY command, so a bare ref would take down the `alert` command
+  # too — meaning the OnFailure alert couldn't even notify about a remote
+  # misconfiguration (the exact failure it exists to report). alert never uses
+  # S3_BACKUP_PATH, and the S3 commands all gate on health_check first, so an empty
+  # value here is harmless.
+  S3_BACKUP_PATH="s3://${S3_BUCKET_NAME:-}/mongodb-backups/"
 fi
 
 # Helper: build mongo auth args as an array (prevents shell-quoting issues)
