@@ -1004,7 +1004,13 @@ alert() {
   local lines="${ALERT_JOURNAL_LINES:-40}"
   local tail_text=""
   if command -v journalctl >/dev/null 2>&1; then
-    tail_text=$(journalctl -u "$unit" -n "$lines" --no-pager -o cat 2>/dev/null || true)
+    # Scope to the unit's MOST RECENT invocation (the run that just failed), so a
+    # short failure right after a chatty successful run isn't buried under — or
+    # truncated away by — the previous run's output. `--invocation=0` is systemd
+    # v254+; on older systemd it errors (→ empty here) and we fall back to a plain
+    # tail across history (the original behaviour).
+    tail_text=$(journalctl -u "$unit" --invocation=0 -n "$lines" --no-pager -o cat 2>/dev/null || true)
+    [ -n "$tail_text" ] || tail_text=$(journalctl -u "$unit" -n "$lines" --no-pager -o cat 2>/dev/null || true)
   fi
   [ -n "$tail_text" ] || tail_text="(no journal output available for ${unit} — is this running under systemd with journal access?)"
 
@@ -1026,9 +1032,17 @@ alert() {
       # the `if` condition so its failure short-circuits to the fallback instead of
       # aborting under `set -e` — this function must stay best-effort and reach its
       # `return 0`, or the OnFailure notifier would itself fail noisily.
-      local dmsg payload
+      local dmsg payload dtail
+      # Keep the TAIL of the journal excerpt (the "Run FAILED during stage: …"
+      # line is always last), leaving room for the title + code fences, so a
+      # verbose late-stage failure isn't truncated down to just its progress
+      # output. Discord caps `content` at 2000; stay under 1900.
+      local dbudget=$(( 1900 - ${#title} - 12 ))
+      [ "$dbudget" -lt 0 ] && dbudget=0
+      dtail=$tail_text
+      [ "${#dtail}" -gt "$dbudget" ] && dtail=${dtail: -dbudget}
       # shellcheck disable=SC2016  # single quotes are intentional: this is a printf FORMAT string — %s are consumed by printf and the backticks must stay literal (double quotes would command-substitute them)
-      dmsg=$(printf '%s\n```\n%s\n```' "$title" "$tail_text")
+      dmsg=$(printf '%s\n```\n%s\n```' "$title" "$dtail")
       dmsg=${dmsg:0:1900}
       if command -v jq >/dev/null 2>&1 && payload=$(printf '%s' "$dmsg" | jq -Rs '{content: .}' 2>/dev/null); then
         : # payload built by jq
@@ -1067,8 +1081,14 @@ alert() {
       # (-K -) rather than as an argv argument — otherwise the token would be
       # visible in `ps`/`/proc` on a multi-user host. chat_id is an identifier,
       # not a credential, so it's fine on argv. curl output is discarded.
-      local tmsg
-      tmsg=$(printf '%s\n\n%s' "$title" "$tail_text")
+      local tmsg ttail
+      # Keep the TAIL of the journal excerpt (same rationale as Discord), leaving
+      # room for the title. Telegram caps `text` at 4096; stay under 3900.
+      local tbudget=$(( 3900 - ${#title} - 6 ))
+      [ "$tbudget" -lt 0 ] && tbudget=0
+      ttail=$tail_text
+      [ "${#ttail}" -gt "$tbudget" ] && ttail=${ttail: -tbudget}
+      tmsg=$(printf '%s\n\n%s' "$title" "$ttail")
       tmsg=${tmsg:0:3900}
       # Strip CR/LF from the token before interpolating it into the single-line
       # curl config, so a stray newline can't inject extra curl directives (same
