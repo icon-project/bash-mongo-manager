@@ -114,15 +114,17 @@ if [ -f "$ENV_FILE" ]; then
   # shellcheck disable=SC1090
   source <(tr -d '\r' < "$ENV_FILE")
   set +a
-  # `set -a` above auto-exported every .env value, so the alert secrets would be
+  # `set -a` above auto-exported every .env value, so the secrets would be
   # inherited by every child process (curl, docker, aws, mongodump) and exposed
   # via /proc/<pid>/environ (readable by the same UID / root) for that child's
-  # lifetime. Nothing spawned by this script needs them in its environment —
-  # alert() reads them as shell variables and hands the webhook/bot URL to curl
-  # through a stdin config, not the environment — so drop the export attribute
-  # while keeping the values in-process. (export -n on an unset name is a
-  # harmless no-op; keep this list in sync with the alert vars.)
-  export -n DISCORD_WEBHOOK_URL TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID 2>/dev/null || true
+  # lifetime. Nothing spawned by this script needs any of these in its
+  # environment: MONGO_PASSWORD is passed to mongodump/mongorestore/mongosh as a
+  # command-line flag (built in build_mongo*_auth_args), and alert() hands the
+  # webhook/bot URL to curl through a stdin config — all as shell variables, which
+  # survive un-exporting. So drop the export attribute while keeping the values
+  # in-process. (export -n on an unset name is a harmless no-op; keep this list in
+  # sync with the secret-bearing vars.)
+  export -n MONGO_PASSWORD DISCORD_WEBHOOK_URL TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID 2>/dev/null || true
 else
   echo "Error: The .env file is missing. Please create the .env file with the required environment variables."
   exit 1
