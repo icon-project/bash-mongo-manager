@@ -2,10 +2,11 @@
 #
 # Wired via `OnFailure=mongo-backup-alert.service` in mongo-backup.service:
 # systemd starts this oneshot whenever a scheduled backup exits non-zero. It runs
-# `mongo_backup_manager.sh alert mongo-backup.service`, which tails that unit's
-# journal — carrying the ">>> STAGE: ..." markers and the "Run FAILED during
-# stage: ..." line — and posts it to Discord and/or Telegram. So the alert shows
-# which stage died (mongodump vs the S3 upload vs a prune), not just "it failed".
+# `mongo_backup_manager.sh alert mongo-backup.service`, which reads the failed
+# run's block from the on-disk run log (logs/mongo_backup_manager.log) — carrying
+# the ">>> STAGE: ..." markers and the "Run FAILED during stage: ..." line — and
+# posts it to Discord and/or Telegram. So the alert shows which stage died
+# (mongodump vs the S3 upload vs a prune), not just "it failed".
 #
 # Install alongside the backup units:
 #   sudo cp systemd/mongo-backup-alert.service /etc/systemd/system/
@@ -16,8 +17,8 @@
 #   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...   # and/or
 #   TELEGRAM_BOT_TOKEN=123456:AA...   TELEGRAM_CHAT_ID=-1001234567890
 #
-# Test it without breaking anything real (it just posts a "no journal" style
-# message if the backup unit hasn't failed):
+# Test it without breaking anything real (it posts the last run's block from the
+# run log, or a "no run log" placeholder if the backup has never run):
 #   sudo systemctl start mongo-backup-alert.service
 #   journalctl -u mongo-backup-alert.service -e
 
@@ -35,11 +36,11 @@ Type=oneshot
 # owns .env removes that boundary entirely. (The script also refuses to source a
 # non-root-owned / group-writable .env when it *is* run as root, as a backstop.)
 #
-# Reading another unit's journal (`journalctl -u mongo-backup.service`) as a
-# non-root user requires membership in the `systemd-journal` group:
-#   sudo usermod -aG systemd-journal youruser
-# The alert command skips the script's on-disk log (output goes to the journal),
-# so it needs no write access to the backups/logs directory.
+# The alert reads the failed run's block from the on-disk run log, so it needs
+# only READ access to logs/ (the same user owns it) — no extra groups. The
+# journal is only a fallback for when the log is missing/empty; if you want that
+# fallback to work for a non-root user, add it to the `systemd-journal` group:
+#   sudo usermod -aG systemd-journal youruser   # optional, fallback only
 User=youruser
 Group=youruser
 WorkingDirectory=/opt/mongo-backup

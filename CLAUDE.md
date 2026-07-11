@@ -121,20 +121,36 @@ There is no linter configured; if changing the script, validate manually with
   and sets an explicit `PATH` (cron/systemd start with a minimal one, so `docker`/`aws`/`mongosh`
   wouldn't otherwise resolve).
 - **Failure alerting**: `mongo-backup.service` has `OnFailure=mongo-backup-alert.service`; that
-  companion oneshot runs `mongo_backup_manager.sh alert mongo-backup.service`, which tails the
-  failed unit's journal (`journalctl -u … -o cat`) and posts it to Discord and/or Telegram.
-  It runs as the **same unprivileged user** as the backup (in the `systemd-journal` group so it
-  can read the unit journal), **not root** — the script `source`s `.env`, so a root alert + a
-  backup-user-writable `.env` would be a local privilege escalation. As a backstop the script
-  refuses to source a non-root-owned or group/other-writable `.env` when it *is* run as root
-  (`id -u`==0 check before the `source`).
+  companion oneshot runs `mongo_backup_manager.sh alert mongo-backup.service` and posts the failed
+  run's output to Discord and/or Telegram. The excerpt comes from the **on-disk run log**
+  (`$LOG_FILE`, which every non-alert run mirrors via `tee`), sliced from the LAST `Run started
+  at …` header to EOF — so it's exactly the run that just failed, with no systemd-journal coupling
+  (no `--invocation` version gate, no post-exit `InvocationID` lookup, no `systemd-journal`
+  read permission) and no bleed from a prior successful run. The block is trusted only if THIS
+  failure just wrote it — **both** the file mtime is fresh (within `ALERT_LOG_MAX_AGE_SECS`, default
+  300s) **and** the block carries the `Run FAILED during stage: …` marker (the EXIT trap writes it
+  on any non-zero exit). Freshness catches a stale block from a log the run could no longer append
+  to — even one that ended in an *earlier* `Run FAILED` (the marker alone can't tell that apart);
+  the marker catches a fresh-but-incomplete block from a run killed before the trap (SIGKILL/OOM).
+  Either miss → a plain `journalctl -u <unit>` tail **fallback**, so the alert always reports the
+  current failed run, never a stale one. The
+  per-destination char-cap truncation keeps the **tail** of the excerpt (not the head),
+  so the `Run FAILED during stage: …` line — always last — survives even a verbose late-stage
+  failure. (Both truncations only tail when the char budget is positive, so a pathologically long
+  title can't trip the `${var: -0}` whole-string return.)
+  It runs as the **same unprivileged user** as the backup, **not root** — the script `source`s
+  `.env`, so a root alert + a backup-user-writable `.env` would be a local privilege escalation. As
+  a backstop the script refuses to source a non-root-owned or group/other-writable `.env` when it
+  *is* run as root (`id -u`==0 check before the `source`). Reading the run log needs only read
+  access to `logs/` (the same user owns it); the `systemd-journal` group is now only relevant to the
+  journal *fallback*.
   A **stage marker** makes the alert unambiguous: `stage "<name>"` sets a global `CURRENT_STAGE`
   and echoes `>>> STAGE: <name>` into the log/journal at each transition. The dispatcher runs
   `resolve container` first (shared by backup/restore/verify); then each command advances it —
   backup: `prepare dump → mongodump → copy dump to host → S3 upload → S3 prune → local prune`;
   restore: `restore preflight → copy archive to container → mongorestore`; verify: `verify`. The
   `log_run_end` EXIT trap prints `Run FAILED during stage: <CURRENT_STAGE>` on a non-zero exit,
-  so the journal tail the alert forwards names the culprit (every path advances past
+  so the run-log tail the alert forwards names the culprit (every path advances past
   `resolve container`, so a failure is never misattributed to name resolution). The `alert` command is **best-effort by contract**: it never
   runs `health_check`/`resolve_container` (it fires *because* the backup broke, maybe because the
   container is gone), each destination is attempted independently, a failed send only warns, and

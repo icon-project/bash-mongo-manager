@@ -996,17 +996,47 @@ alert() {
     return 0
   fi
 
-  # Gather the recent journal for the failed unit. Reading another unit's journal
-  # as a non-root user requires membership in the `systemd-journal` group, which
-  # mongo-backup-alert.service documents (it runs as the same unprivileged user as
-  # the backup, not root — see the unit file). If journalctl is unavailable or
-  # returns nothing, still send a (less specific) alert rather than staying silent.
+  # Gather the failed run's output. Primary source is the on-disk run log that
+  # every non-alert run mirrors via `tee` ($LOG_FILE): each run is bracketed by a
+  # "Run started at …" header and, via the EXIT trap, a "Run FAILED during
+  # stage: … / Run ended … (exit N)" trailer. Slicing from the LAST "Run started
+  # at" to EOF yields exactly the run that just failed — no systemd-journal
+  # coupling (no `--invocation` version gate, no post-exit InvocationID lookup, no
+  # `systemd-journal` group / journal-read permission) and no bleed from a prior
+  # successful run. Bounded to the last $lines lines here; the per-destination
+  # char cap below keeps the *tail* so the "Run FAILED during stage" line survives.
   local lines="${ALERT_JOURNAL_LINES:-40}"
   local tail_text=""
-  if command -v journalctl >/dev/null 2>&1; then
+  if [ -r "$LOG_FILE" ]; then
+    # Trust the log only if THIS failure just wrote it — two signals, both required:
+    #   (1) Freshness: the file was modified within ALERT_LOG_MAX_AGE_SECS (default
+    #       300s) of now. A block the run could no longer append to (read-only /
+    #       permission-broken / rotated-away log) keeps an OLD mtime — even when that
+    #       stale block itself ended in an *earlier* "Run FAILED", so the marker
+    #       alone (below) isn't enough to tell it apart from the current failure.
+    #   (2) Marker: the last block carries "Run FAILED during stage: …", which the
+    #       EXIT trap writes on every non-zero exit (a fresh but markerless block =
+    #       a run killed before the trap, e.g. SIGKILL/OOM).
+    # Either miss → discard and fall through to the journal, so the alert always
+    # reports the current failed run, never a stale one.
+    local max_age="${ALERT_LOG_MAX_AGE_SECS:-300}" now_epoch mtime_epoch
+    now_epoch=$(date +%s 2>/dev/null || echo 0)
+    mtime_epoch=$(stat -c %Y "$LOG_FILE" 2>/dev/null || stat -f %m "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$now_epoch" -gt 0 ] && [ "$mtime_epoch" -gt 0 ] && [ "$(( now_epoch - mtime_epoch ))" -le "$max_age" ]; then
+      tail_text=$(awk '/^Run started at /{buf=""} {buf=buf $0 ORS} END{printf "%s", buf}' "$LOG_FILE" 2>/dev/null | tail -n "$lines")
+      case "$tail_text" in
+        *"Run FAILED during stage"*) : ;;   # fresh + the failed run's own block — use it
+        *) tail_text="" ;;                    # fresh but markerless (killed pre-trap) — fall back
+      esac
+    fi
+  fi
+  # Fallback: if the run log is missing/empty/stale (e.g. a SIGKILL/OOM before the
+  # run could write, an unwritable log, or a misconfigured path), fall back to a
+  # plain journal tail so we still report the failed run rather than the wrong one.
+  if [ -z "$tail_text" ] && command -v journalctl >/dev/null 2>&1; then
     tail_text=$(journalctl -u "$unit" -n "$lines" --no-pager -o cat 2>/dev/null || true)
   fi
-  [ -n "$tail_text" ] || tail_text="(no journal output available for ${unit} — is this running under systemd with journal access?)"
+  [ -n "$tail_text" ] || tail_text="(no run log at ${LOG_FILE} and no journal output for ${unit} — is the backup writing its log?)"
 
   local host when
   host=$(hostname 2>/dev/null || echo "unknown-host")
@@ -1026,9 +1056,23 @@ alert() {
       # the `if` condition so its failure short-circuits to the fallback instead of
       # aborting under `set -e` — this function must stay best-effort and reach its
       # `return 0`, or the OnFailure notifier would itself fail noisily.
-      local dmsg payload
+      local dmsg payload dtail
+      # Keep the TAIL of the journal excerpt (the "Run FAILED during stage: …"
+      # line is always last), leaving room for the title + code fences, so a
+      # verbose late-stage failure isn't truncated down to just its progress
+      # output. Discord caps `content` at 2000; stay under 1900.
+      local dbudget=$(( 1900 - ${#title} - 12 ))
+      # Only tail when the budget is positive: `${dtail: -0}` would return the
+      # WHOLE excerpt (offset 0), which the head-clamp below could then chop,
+      # dropping the failure line. A non-positive budget (pathologically long
+      # title) → title-only alert instead.
+      dtail=""
+      if [ "$dbudget" -gt 0 ]; then
+        dtail=$tail_text
+        [ "${#dtail}" -gt "$dbudget" ] && dtail=${dtail: -dbudget}
+      fi
       # shellcheck disable=SC2016  # single quotes are intentional: this is a printf FORMAT string — %s are consumed by printf and the backticks must stay literal (double quotes would command-substitute them)
-      dmsg=$(printf '%s\n```\n%s\n```' "$title" "$tail_text")
+      dmsg=$(printf '%s\n```\n%s\n```' "$title" "$dtail")
       dmsg=${dmsg:0:1900}
       if command -v jq >/dev/null 2>&1 && payload=$(printf '%s' "$dmsg" | jq -Rs '{content: .}' 2>/dev/null); then
         : # payload built by jq
@@ -1067,8 +1111,17 @@ alert() {
       # (-K -) rather than as an argv argument — otherwise the token would be
       # visible in `ps`/`/proc` on a multi-user host. chat_id is an identifier,
       # not a credential, so it's fine on argv. curl output is discarded.
-      local tmsg
-      tmsg=$(printf '%s\n\n%s' "$title" "$tail_text")
+      local tmsg ttail
+      # Keep the TAIL of the journal excerpt (same rationale as Discord), leaving
+      # room for the title. Telegram caps `text` at 4096; stay under 3900.
+      local tbudget=$(( 3900 - ${#title} - 6 ))
+      # Same positive-budget guard as Discord (avoid the `${ttail: -0}` whole-string trap).
+      ttail=""
+      if [ "$tbudget" -gt 0 ]; then
+        ttail=$tail_text
+        [ "${#ttail}" -gt "$tbudget" ] && ttail=${ttail: -tbudget}
+      fi
+      tmsg=$(printf '%s\n\n%s' "$title" "$ttail")
       tmsg=${tmsg:0:3900}
       # Strip CR/LF from the token before interpolating it into the single-line
       # curl config, so a stray newline can't inject extra curl directives (same
