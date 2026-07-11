@@ -292,19 +292,33 @@ resolve_container() {
     return 0
   fi
 
-  # No exact match — treat CONTAINER_NAME as a prefix. Count non-empty lines.
-  # `grep -c .` returns 0 (and exit 1) on empty input, so guard with `|| true`
-  # to keep `set -e` from aborting on the no-match case.
+  # No exact match — treat CONTAINER_NAME as a PREFIX. Docker's `name=` filter
+  # matches the string *anywhere* in the name, not just at the start, so without
+  # this step `CONTAINER_NAME=sodax-stateful-mongo` could resolve to an unrelated
+  # `old-sodax-stateful-mongo-sidecar` while the real DB container is down —
+  # backing up (or, on restore, overwriting) the wrong container. Post-filter the
+  # results to names that actually *begin* with the configured value. The case
+  # glob quotes "$CONTAINER_NAME" so it's a literal prefix (no pattern chars) and
+  # only the trailing * is a wildcard.
+  local prefixed="" m
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    case "$m" in "$CONTAINER_NAME"*) prefixed+="${m}"$'\n' ;; esac
+  done <<< "$matches"
+  matches="${prefixed%$'\n'}"
+
+  # Count non-empty lines. `grep -c .` returns 0 (and exit 1) on empty input, so
+  # guard with `|| true` to keep `set -e` from aborting on the no-match case.
   count=$(printf '%s\n' "$matches" | grep -c . || true)
 
   if [ "$count" -eq 0 ]; then
-    echo "Error: CONTAINER_NAME '${CONTAINER_NAME}' matches no running container." >&2
+    echo "Error: CONTAINER_NAME '${CONTAINER_NAME}' matches no running container by exact name or name prefix." >&2
     echo "       Check the container is up ('docker ps') and that CONTAINER_NAME is its exact" >&2
     echo "       name or a stable name prefix (e.g. 'sodax-stateful-mongo')." >&2
     exit 1
   fi
   if [ "$count" -gt 1 ]; then
-    echo "Error: CONTAINER_NAME '${CONTAINER_NAME}' is ambiguous — it matches $count running containers:" >&2
+    echo "Error: CONTAINER_NAME '${CONTAINER_NAME}' is ambiguous — it prefix-matches $count running containers:" >&2
     while IFS= read -r m; do [ -n "$m" ] && echo "         - $m" >&2; done <<< "$matches"
     echo "       Use the exact container name or a longer, unique prefix." >&2
     exit 1

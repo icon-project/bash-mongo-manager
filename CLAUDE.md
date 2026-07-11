@@ -55,12 +55,14 @@ There is no linter configured; if changing the script, validate manually with
 - **Container-name resolution** (`resolve_container`): `CONTAINER_NAME` may be an exact name
   (backward-compatible) *or* a stable prefix (Coolify regenerates the full
   `sodax-stateful-mongo-<hash>-<ts>` name on every redeploy). Resolved at run time via
-  `docker ps --filter name=` (running only, unanchored substring = prefix match). An **exact**
-  `{{.Names}}` match wins if one is running (so an exact name that's also a substring of another
-  container — `mongo` vs `mongo-express` — isn't wrongly rejected as ambiguous); only when there's
-  no exact hit does it treat the value as a prefix, where **exactly one** match is required — 0
-  (nothing up) or >1 (ambiguous) is a hard error, never a guess (wrong container = wrong backup,
-  or on restore a destructive overwrite). It
+  `docker ps --filter name=` (running only). Docker's `name=` is an *unanchored substring* match,
+  so the results are post-processed: an **exact** `{{.Names}}` match wins if one is running (so an
+  exact name that's also a substring of another container — `mongo` vs `mongo-express` — isn't
+  wrongly rejected as ambiguous); otherwise the results are **filtered to names that actually
+  start with** the configured value (a bare substring like `old-<prefix>-sidecar` is *not* a
+  prefix match, so it can't be silently picked when the real container is down), and **exactly
+  one** must remain — 0 (nothing up) or >1 (ambiguous) is a hard error, never a guess (wrong
+  container = wrong backup, or on restore a destructive overwrite). It
   mutates the global `CONTAINER_NAME` in place and is called once from the dispatcher, right
   after `health_check`, for **backup/restore/verify only** — the list/download/alert commands
   don't touch the container and must not require one to be running.
