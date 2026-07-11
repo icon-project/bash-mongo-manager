@@ -1010,12 +1010,16 @@ alert() {
     if command -v curl >/dev/null 2>&1; then
       # Discord caps message `content` at 2000 chars; keep the fenced journal
       # tail comfortably under that. Prefer jq to build the JSON (correct for any
-      # bytes); fall back to the in-script escaper when jq isn't installed.
+      # bytes); fall back to the in-script escaper when jq isn't installed OR when
+      # it errors (e.g. invalid UTF-8 in the journal tail, OOM). The jq call is in
+      # the `if` condition so its failure short-circuits to the fallback instead of
+      # aborting under `set -e` — this function must stay best-effort and reach its
+      # `return 0`, or the OnFailure notifier would itself fail noisily.
       local dmsg payload
       dmsg=$(printf '%s\n```\n%s\n```' "$title" "$tail_text")
       dmsg=${dmsg:0:1900}
-      if command -v jq >/dev/null 2>&1; then
-        payload=$(printf '%s' "$dmsg" | jq -Rs '{content: .}')
+      if command -v jq >/dev/null 2>&1 && payload=$(printf '%s' "$dmsg" | jq -Rs '{content: .}' 2>/dev/null); then
+        : # payload built by jq
       else
         payload=$(printf '{"content":"%s"}' "$(json_escape_body "$dmsg")")
       fi
