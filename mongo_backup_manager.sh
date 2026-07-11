@@ -23,15 +23,23 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 # Define log file
 LOG_FILE="${SCRIPT_DIR}/logs/mongo_backup_manager.log"
 
-# Ensure logs dir exists
-mkdir -p "$(dirname "$LOG_FILE")"
-
 # Mirror everything this run prints (stdout + stderr) into the log while still
 # showing it on the terminal / journal. Previously only the run separators were
 # written here, so the "log" recorded timestamps but none of the actual output;
 # tee makes it a real record however the script is invoked. Using a process
 # substitution (not a `| tee` pipe) keeps the script's own exit status intact.
-exec > >(tee -a "$LOG_FILE") 2>&1
+#
+# EXCEPT for the `alert` command: it's invoked by systemd's OnFailure hook and
+# usually runs as ROOT (it must read a system unit's journal), while the backup
+# runs as an unprivileged user. If the root-run alert created logs/ (or the log
+# file) first, it would own them, and the non-root backup could then no longer
+# append via tee -a — silently breaking backup logging (or the run). So the
+# alert path skips on-disk logging entirely; its output still reaches systemd's
+# journal via stdout. Only non-alert commands mkdir logs/ and tee to the file.
+if [ "${1:-}" != "alert" ]; then
+  mkdir -p "$(dirname "$LOG_FILE")"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+fi
 
 # Track which stage of a run is executing so a failure is attributable — did the
 # backup die in mongodump, the S3 upload, or a prune? `stage` records the name
@@ -261,16 +269,32 @@ json_escape_body() {
 #   * a stable name prefix (e.g. "sodax-stateful-mongo").
 # We resolve it at run time via `docker ps` (RUNNING containers only — no -a, so
 # stale stopped containers from prior deploys are ignored). Docker's `name`
-# filter is an unanchored substring match, which is exactly the prefix behavior
-# we want. We insist on EXACTLY one live match: 0 (nothing running) and >1
-# (ambiguous) are hard errors rather than a guess, because picking the wrong
-# container would back up — or, on restore, overwrite — the wrong database.
+# filter matches "all or part" of a name (an unanchored substring), which is
+# exactly the prefix behavior we want. But that substring match also means an
+# EXACT name that happens to be a substring of another running container's name
+# (e.g. "mongo" alongside "mongo-express", or "sodax-stateful-mongo" alongside an
+# old sidecar carrying that substring) would come back as >1 and wrongly abort as
+# ambiguous — regressing a previously valid exact-name config. So we prefer an
+# EXACT `{{.Names}}` match when one is running, and only fall back to the
+# prefix/substring path when there's no exact hit. On the prefix path we insist
+# on EXACTLY one live match: 0 (nothing running) and >1 (ambiguous) are hard
+# errors rather than a guess, because picking the wrong container would back up —
+# or, on restore, overwrite — the wrong database.
 resolve_container() {
   stage "resolve container"
   local matches count
   matches=$(docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}')
-  # Count non-empty lines. `grep -c .` returns 0 (and exit 1) on empty input, so
-  # guard with `|| true` to keep `set -e` from aborting on the no-match case.
+
+  # Exact name wins: if the configured value is itself one of the running
+  # containers, use it as-is (backward-compatible) regardless of any other
+  # containers whose names merely contain it as a substring.
+  if printf '%s\n' "$matches" | grep -qxF -- "$CONTAINER_NAME"; then
+    return 0
+  fi
+
+  # No exact match — treat CONTAINER_NAME as a prefix. Count non-empty lines.
+  # `grep -c .` returns 0 (and exit 1) on empty input, so guard with `|| true`
+  # to keep `set -e` from aborting on the no-match case.
   count=$(printf '%s\n' "$matches" | grep -c . || true)
 
   if [ "$count" -eq 0 ]; then
@@ -286,9 +310,8 @@ resolve_container() {
     exit 1
   fi
 
-  if [ "$matches" != "$CONTAINER_NAME" ]; then
-    echo "Resolved container name prefix '${CONTAINER_NAME}' -> '${matches}'."
-  fi
+  # Exactly one prefix match (and no exact match, or we'd have returned above).
+  echo "Resolved container name prefix '${CONTAINER_NAME}' -> '${matches}'."
   CONTAINER_NAME="$matches"
 }
 

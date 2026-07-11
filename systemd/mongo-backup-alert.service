@@ -32,7 +32,9 @@ Type=oneshot
 # *system* unit's journal (`journalctl -u mongo-backup.service`) needs privilege,
 # and root can also read the backup's .env for the alert secrets. If you instead
 # run it as a non-root user, that user must be in the `systemd-journal` group and
-# able to read the .env.
+# able to read the .env. (The `alert` command deliberately skips the script's
+# on-disk log so this root run can't create logs/ root-owned and lock the
+# unprivileged backup out of its own log — alert output goes to the journal.)
 WorkingDirectory=/opt/mongo-backup
 ExecStart=/opt/mongo-backup/mongo_backup_manager.sh alert mongo-backup.service
 # -----------------------------------------------------------------------------
