@@ -29,13 +29,14 @@ LOG_FILE="${SCRIPT_DIR}/logs/mongo_backup_manager.log"
 # tee makes it a real record however the script is invoked. Using a process
 # substitution (not a `| tee` pipe) keeps the script's own exit status intact.
 #
-# EXCEPT for the `alert` command: it's invoked by systemd's OnFailure hook and
-# usually runs as ROOT (it must read a system unit's journal), while the backup
-# runs as an unprivileged user. If the root-run alert created logs/ (or the log
-# file) first, it would own them, and the non-root backup could then no longer
-# append via tee -a — silently breaking backup logging (or the run). So the
-# alert path skips on-disk logging entirely; its output still reaches systemd's
-# journal via stdout. Only non-alert commands mkdir logs/ and tee to the file.
+# EXCEPT for the `alert` command: it's a notifier invoked by systemd's OnFailure
+# hook, so its natural sink is the journal (via stdout), not the backup's on-disk
+# log. Skipping file logging here also keeps it robust to who runs it: the shipped
+# mongo-backup-alert.service runs as the same unprivileged user as the backup, but
+# if an operator overrides it to run as root, a root-created logs/ (or log file)
+# would then be un-appendable by the non-root backup — silently breaking backup
+# logging. So the alert path skips on-disk logging entirely; only non-alert
+# commands mkdir logs/ and tee to the file.
 if [ "${1:-}" != "alert" ]; then
   mkdir -p "$(dirname "$LOG_FILE")"
   exec > >(tee -a "$LOG_FILE") 2>&1
@@ -966,10 +967,11 @@ alert() {
     return 0
   fi
 
-  # Gather the recent journal for the failed unit. Reading a *system* unit's
-  # journal needs privilege, so mongo-backup-alert.service runs as root (see the
-  # unit file). If journalctl is unavailable or returns nothing, still send a
-  # (less specific) alert rather than staying silent.
+  # Gather the recent journal for the failed unit. Reading another unit's journal
+  # as a non-root user requires membership in the `systemd-journal` group, which
+  # mongo-backup-alert.service documents (it runs as the same unprivileged user as
+  # the backup, not root — see the unit file). If journalctl is unavailable or
+  # returns nothing, still send a (less specific) alert rather than staying silent.
   local lines="${ALERT_JOURNAL_LINES:-40}"
   local tail_text=""
   if command -v journalctl >/dev/null 2>&1; then
