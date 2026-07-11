@@ -722,6 +722,10 @@ restore() {
     TARGET_DB="$MONGO_DB_NAME"
   fi
 
+  # Update the stage off the "resolve container" value so a failure from here on
+  # is attributed to the restore, not to the (already-succeeded) name resolution.
+  stage "restore preflight"
+
   # Preflight: fail fast with a clear message if the configured credentials
   # can't reach the destination database, instead of failing partway through
   # mongorestore with a confusing "listCollections requires authentication".
@@ -746,9 +750,11 @@ restore() {
     echo "Preflight: mongosh not found in container; skipping auth preflight."
   fi
 
+  stage "copy archive to container"
   echo "Copying MongoDB backup file to the container..."
   docker cp "$RESTORE_FILE" "$CONTAINER_NAME:/tmp/$(basename "$RESTORE_FILE")"
   echo "Restoring MongoDB backup from $RESTORE_FILE..."
+  stage "mongorestore"
 
   # Build args safely (NO sh -c)
   local AUTH_ARGS=()
@@ -824,6 +830,10 @@ verify() {
   local SRC_COL=$2
   local DST_DB=$3
   local DST_COL=$4
+
+  # Move off the "resolve container" stage so a verify failure isn't misattributed
+  # to name resolution in the EXIT trap.
+  stage "verify"
 
   echo "Verifying ${SRC_DB}.${SRC_COL} -> ${DST_DB}.${DST_COL}..."
 
