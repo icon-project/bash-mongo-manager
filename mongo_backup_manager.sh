@@ -338,7 +338,16 @@ json_escape_body() {
 resolve_container() {
   stage "resolve container"
   local matches count
-  matches=$(docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}')
+  # Run docker ps inside an `if` so a Docker-side failure (daemon down,
+  # permission denied) doesn't hard-exit via `set -e` with only Docker's raw
+  # error — we add an actionable hint and still exit non-zero. Docker's own error
+  # is left on stderr (so it's in the journal/log the alert forwards); only stdout
+  # (the names) is captured.
+  if ! matches=$(docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}'); then
+    echo "Error: 'docker ps' failed while resolving CONTAINER_NAME '${CONTAINER_NAME}' (see the Docker error above)." >&2
+    echo "       Is the Docker daemon running and reachable by user '$(id -un)' (in the docker group, or root)?" >&2
+    exit 1
+  fi
 
   # Exact name wins: if the configured value is itself one of the running
   # containers, use it as-is (backward-compatible) regardless of any other
