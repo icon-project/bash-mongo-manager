@@ -996,32 +996,27 @@ alert() {
     return 0
   fi
 
-  # Gather the recent journal for the failed unit. Reading another unit's journal
-  # as a non-root user requires membership in the `systemd-journal` group, which
-  # mongo-backup-alert.service documents (it runs as the same unprivileged user as
-  # the backup, not root — see the unit file). If journalctl is unavailable or
-  # returns nothing, still send a (less specific) alert rather than staying silent.
+  # Gather the failed run's output. Primary source is the on-disk run log that
+  # every non-alert run mirrors via `tee` ($LOG_FILE): each run is bracketed by a
+  # "Run started at …" header and, via the EXIT trap, a "Run FAILED during
+  # stage: … / Run ended … (exit N)" trailer. Slicing from the LAST "Run started
+  # at" to EOF yields exactly the run that just failed — no systemd-journal
+  # coupling (no `--invocation` version gate, no post-exit InvocationID lookup, no
+  # `systemd-journal` group / journal-read permission) and no bleed from a prior
+  # successful run. Bounded to the last $lines lines here; the per-destination
+  # char cap below keeps the *tail* so the "Run FAILED during stage" line survives.
   local lines="${ALERT_JOURNAL_LINES:-40}"
   local tail_text=""
-  if command -v journalctl >/dev/null 2>&1; then
-    # Scope to the unit's MOST RECENT invocation (the run that just failed), so a
-    # short failure right after a chatty successful run isn't buried under — or
-    # truncated away by — the previous run's output. Match on the invocation ID
-    # (`_SYSTEMD_INVOCATION_ID=`, portable back to systemd v232) rather than
-    # `--invocation=0`, which only exists on systemd v257+ — v254–256 reject it
-    # (e.g. Ubuntu 24.04 ships v255), which would silently defeat the scoping.
-    local inv=""
-    if command -v systemctl >/dev/null 2>&1; then
-      inv=$(systemctl show -p InvocationID --value "$unit" 2>/dev/null || true)
-    fi
-    if [ -n "$inv" ]; then
-      tail_text=$(journalctl _SYSTEMD_INVOCATION_ID="$inv" -n "$lines" --no-pager -o cat 2>/dev/null || true)
-    fi
-    # Fall back to the plain across-history tail if the invocation ID is
-    # unavailable (no systemctl, unit never started, permission-scoped away).
-    [ -n "$tail_text" ] || tail_text=$(journalctl -u "$unit" -n "$lines" --no-pager -o cat 2>/dev/null || true)
+  if [ -r "$LOG_FILE" ]; then
+    tail_text=$(awk '/^Run started at /{buf=""} {buf=buf $0 ORS} END{printf "%s", buf}' "$LOG_FILE" 2>/dev/null | tail -n "$lines")
   fi
-  [ -n "$tail_text" ] || tail_text="(no journal output available for ${unit} — is this running under systemd with journal access?)"
+  # Fallback: if the run log is missing/empty (e.g. a SIGKILL/OOM before the run
+  # could write, or a misconfigured path), fall back to a plain journal tail so we
+  # still send *something* rather than staying silent.
+  if [ -z "$tail_text" ] && command -v journalctl >/dev/null 2>&1; then
+    tail_text=$(journalctl -u "$unit" -n "$lines" --no-pager -o cat 2>/dev/null || true)
+  fi
+  [ -n "$tail_text" ] || tail_text="(no run log at ${LOG_FILE} and no journal output for ${unit} — is the backup writing its log?)"
 
   local host when
   host=$(hostname 2>/dev/null || echo "unknown-host")
