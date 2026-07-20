@@ -123,8 +123,9 @@ if [ -f "$ENV_FILE" ]; then
   # webhook/bot URL to curl through a stdin config — all as shell variables, which
   # survive un-exporting. So drop the export attribute while keeping the values
   # in-process. (export -n on an unset name is a harmless no-op; keep this list in
-  # sync with the secret-bearing vars.)
-  export -n MONGO_PASSWORD DISCORD_WEBHOOK_URL TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID 2>/dev/null || true
+  # sync with the secret-bearing vars — MONGO_TLS_CERT_KEY_FILE_PASSWORD is likewise
+  # passed to the tools as a --tlsCertificateKeyFilePassword flag via build_mongo*_tls_args.)
+  export -n MONGO_PASSWORD MONGO_TLS_CERT_KEY_FILE_PASSWORD DISCORD_WEBHOOK_URL TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID 2>/dev/null || true
 else
   echo "Error: The .env file is missing. Please create the .env file with the required environment variables."
   exit 1
