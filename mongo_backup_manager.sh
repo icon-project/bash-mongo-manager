@@ -1246,6 +1246,9 @@ help() {
   echo "  USE_REMOTE=false       Skip all S3 uploads/downloads/list operations."
   echo "  USE_ALERTS=true        Enable failure alerting (needs DISCORD_WEBHOOK_URL and/or"
   echo "                         TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)."
+  echo "  USE_TLS=true           Connect to mongod over TLS (mongodump/mongorestore/mongosh)."
+  echo "                         Tune with MONGO_TLS_CA_FILE, MONGO_TLS_CERT_KEY_FILE[_PASSWORD],"
+  echo "                         and MONGO_TLS_ALLOW_INVALID; see .env-example / README."
   echo
   echo "  CONTAINER_NAME may be an exact container name or a stable prefix (e.g."
   echo "  sodax-stateful-mongo); it's resolved at run time to the single running match."
