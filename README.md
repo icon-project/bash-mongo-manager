@@ -84,6 +84,7 @@ MONGO_DB_NAME="test"
 USE_CREDENTIALS="true" # set to false if the DB has no auth
 USE_REMOTE="false"     # set to true to enable S3 upload/download/list/prune
 USE_ALERTS="false"     # set to true to alert (Discord/Telegram) when a run fails
+USE_TLS="false"        # set to true when the mongod runs net.tls.mode=requireTLS
 ```
 | Variable           | Description                                                                |
 |--------------------|----------------------------------------------------------------------------|
@@ -100,12 +101,29 @@ USE_ALERTS="false"     # set to true to alert (Discord/Telegram) when a run fail
 | `DISCORD_WEBHOOK_URL` | Discord webhook URL to post a failure alert to (required for Discord alerts when `USE_ALERTS=true`). **Secret — never commit.**|
 | `TELEGRAM_BOT_TOKEN`  | Telegram bot token from `@BotFather` (required, together with `TELEGRAM_CHAT_ID`, for Telegram alerts when `USE_ALERTS=true`). **Secret — never commit.**|
 | `TELEGRAM_CHAT_ID`    | Telegram chat/channel id to send the alert to (required together with `TELEGRAM_BOT_TOKEN`).|
+| `USE_TLS`             | When `true`, `mongodump`/`mongorestore`/`mongosh` connect over TLS. Defaults to `false`. Set this whenever the mongod runs `net.tls.mode=requireTLS` — a plaintext client is otherwise rejected mid-handshake (`socket was unexpectedly closed: EOF`). See "TLS connections" below.|
+| `MONGO_TLS_CA_FILE`   | Optional. Path **inside the container** to the CA `.pem` used to validate the server certificate (`--tlsCAFile`). Omit to use the container's system CA store.|
+| `MONGO_TLS_CERT_KEY_FILE` | Optional. Path **inside the container** to the client certificate+key `.pem` (`--tlsCertificateKeyFile`), only if the server requires client certificates.|
+| `MONGO_TLS_ALLOW_INVALID` | When `true`, skip validation of the server's certificate chain **and** hostname. Defaults to `false`. The connection stays encrypted but unauthenticated. Usually required here because the tools connect to `localhost` inside the container (cert has no `localhost` SAN) or the cert is self-signed. `mongodump`/`mongorestore` get `--tlsInsecure`; `mongosh` gets `--tlsAllowInvalidCertificates --tlsAllowInvalidHostnames`. Prefer `MONGO_TLS_CA_FILE` when the CA is available in the container.|
 
 ### Dynamic container-name resolution
 
 `CONTAINER_NAME` may be an **exact** container name (backward-compatible — it's the sole match) or a **stable name prefix**. This matters on platforms like **Coolify**, which regenerate the container's full name (e.g. `sodax-stateful-mongo-<stackhash>-<timestamp>`) on every redeploy — a hard-coded full name would silently break every `docker exec`/`docker cp` after the first redeploy. Set `CONTAINER_NAME` to the stable prefix (e.g. `sodax-stateful-mongo`) and the script resolves it to the one running container at run time (once per run, shared by `backup`/`restore`/`verify`). If the prefix matches **no** running container (nothing up) or **more than one** (ambiguous), the run aborts with a clear error instead of guessing.
 
 > If your `.env` is saved with Windows (CRLF) line endings, the script strips the trailing carriage return from these values automatically, so a stray `\r` won't break the container name, port, or S3 path. Only the CR is removed — other whitespace (e.g. inside a password) is preserved as-is.
+
+### TLS connections
+
+By default the mongo tools connect in plaintext. If the target mongod runs `net.tls.mode=requireTLS`, that connection is rejected during the TLS handshake and every `backup`/`restore`/`verify` fails with `server selection timeout … socket was unexpectedly closed: EOF`. Set `USE_TLS=true` to make `mongodump`, `mongorestore`, and `mongosh` connect over TLS.
+
+Because the tools run **inside the container** (`docker exec`), any `MONGO_TLS_CA_FILE` / `MONGO_TLS_CERT_KEY_FILE` paths are **container** paths — the files must exist in the container (bake them into the image or bind-mount them). The tools connect to `localhost` inside the container, whose certificate almost never lists `localhost` in its SAN, so the common working configuration is:
+
+```bash
+USE_TLS="true"
+MONGO_TLS_ALLOW_INVALID="true"   # encrypted, validation skipped (localhost/self-signed)
+```
+
+For a validated connection instead, provide `MONGO_TLS_CA_FILE` (and `MONGO_TLS_CERT_KEY_FILE` if the server requires client certs) and leave `MONGO_TLS_ALLOW_INVALID=false`.
 
 ---
 

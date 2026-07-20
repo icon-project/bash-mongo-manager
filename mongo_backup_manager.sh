@@ -139,6 +139,20 @@ USE_REMOTE=$(echo "${USE_REMOTE:-false}" | tr '[:upper:]' '[:lower:]')
 # Off by default so existing deployments are unaffected.
 USE_ALERTS=$(echo "${USE_ALERTS:-false}" | tr '[:upper:]' '[:lower:]')
 
+# TLS for the mongo tool connections (mongodump/mongorestore/mongosh). Off by
+# default so existing deployments are unaffected. Set to true when the target
+# mongod runs net.tls.mode=requireTLS — a plaintext client is otherwise rejected
+# mid-handshake ("socket was unexpectedly closed: EOF" / "server selection timeout").
+USE_TLS=$(echo "${USE_TLS:-false}" | tr '[:upper:]' '[:lower:]')
+# When true, skip validation of the server's certificate chain AND hostname. The
+# connection is still encrypted, just not authenticated. This is the usual setting
+# here because the tools connect to `localhost` *inside the container*, so the
+# server cert (whose SAN is the service hostname, not "localhost") won't validate;
+# a self-signed cert won't either. Prefer setting MONGO_TLS_CA_FILE instead when
+# the CA is available in the container. mongodump/mongorestore get --tlsInsecure;
+# mongosh gets --tlsAllowInvalidCertificates --tlsAllowInvalidHostnames.
+MONGO_TLS_ALLOW_INVALID=$(echo "${MONGO_TLS_ALLOW_INVALID:-false}" | tr '[:upper:]' '[:lower:]')
+
 # Number of days after which S3 backups are pruned. Default 7 (unchanged from the
 # hard-coded value it replaces, so existing deployments are unaffected). 0 skips
 # the S3 prune entirely, delegating retention to an S3 lifecycle policy on the
@@ -283,6 +297,39 @@ build_mongosh_auth_args() {
   fi
 }
 
+# Helper: build mongodump/mongorestore TLS args as an array (--flag=val form, like
+# build_mongo_auth_args). Empty unless USE_TLS is enabled. CA/cert paths are paths
+# *inside the container* (the tools run via docker exec). mongodump/mongorestore
+# take the combined --tlsInsecure to bypass cert-chain + hostname validation.
+build_mongo_tls_args() {
+  # shellcheck disable=SC2178  # _out is a nameref to an array; the string assignment is the ref target, not a value
+  local -n _out=$1
+  _out=()
+  if [ "$USE_TLS" != "false" ]; then
+    _out+=( "--tls" )
+    if [ -n "${MONGO_TLS_CA_FILE:-}" ]; then _out+=( "--tlsCAFile=$MONGO_TLS_CA_FILE" ); fi
+    if [ -n "${MONGO_TLS_CERT_KEY_FILE:-}" ]; then _out+=( "--tlsCertificateKeyFile=$MONGO_TLS_CERT_KEY_FILE" ); fi
+    if [ "$MONGO_TLS_ALLOW_INVALID" != "false" ]; then _out+=( "--tlsInsecure" ); fi
+  fi
+}
+
+# Helper: build mongosh TLS args as an array (space-separated flags, like
+# build_mongosh_auth_args). mongosh exposes the granular --tlsAllowInvalid* flags
+# rather than mongodump's combined --tlsInsecure.
+build_mongosh_tls_args() {
+  # shellcheck disable=SC2178  # _out is a nameref to an array; the string assignment is the ref target, not a value
+  local -n _out=$1
+  _out=()
+  if [ "$USE_TLS" != "false" ]; then
+    _out+=( "--tls" )
+    if [ -n "${MONGO_TLS_CA_FILE:-}" ]; then _out+=( "--tlsCAFile" "$MONGO_TLS_CA_FILE" ); fi
+    if [ -n "${MONGO_TLS_CERT_KEY_FILE:-}" ]; then _out+=( "--tlsCertificateKeyFile" "$MONGO_TLS_CERT_KEY_FILE" ); fi
+    if [ "$MONGO_TLS_ALLOW_INVALID" != "false" ]; then
+      _out+=( "--tlsAllowInvalidCertificates" "--tlsAllowInvalidHostnames" )
+    fi
+  fi
+}
+
 # Helper: emit a value as a JSON/JS string literal (quoted, with backslashes and
 # double quotes escaped). Used so a db/collection name containing a quote or
 # backslash can't break or alter the JS we hand to mongosh. Order matters:
@@ -424,15 +471,17 @@ backup() {
 
   mkdir -p "$BACKUP_DIR"
 
-  # Build auth args safely
+  # Build auth + TLS args safely
   local AUTH_ARGS=()
   build_mongo_auth_args AUTH_ARGS
+  local TLS_ARGS=()
+  build_mongo_tls_args TLS_ARGS
 
   # Empty arrays are expanded with the ${arr[@]+"${arr[@]}"} idiom throughout:
   # on bash 4.3 (which the guard admits) a bare "${arr[@]}" on an *empty* array
   # aborts under `set -u` with "unbound variable" (only fixed in 4.4). AUTH_ARGS
-  # is empty whenever USE_CREDENTIALS=false.
-  local DUMP_ARGS=( "--archive=$BACKUP_FILE_NAME" "--gzip" ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} )
+  # is empty whenever USE_CREDENTIALS=false; TLS_ARGS whenever USE_TLS=false.
+  local DUMP_ARGS=( "--archive=$BACKUP_FILE_NAME" "--gzip" ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} ${TLS_ARGS[@]+"${TLS_ARGS[@]}"} )
   # Set to the collection name only on the no-mongosh single-collection path,
   # where we can't preflight and must instead detect a missing namespace from
   # mongodump's output (it exits 0 in that case).
@@ -460,12 +509,14 @@ backup() {
     if [ "$have_mongosh" -eq 1 ]; then
       local MONGOSH_AUTH=()
       build_mongosh_auth_args MONGOSH_AUTH
+      local MONGOSH_TLS=()
+      build_mongosh_tls_args MONGOSH_TLS
       # JSON-encode the DB name into a JS string literal so a name containing a
       # quote or backslash can't alter the --eval script (see verify / json_str).
       local DB_JS
       DB_JS=$(json_str "$MONGO_DB_NAME")
       local ALL_COLLECTIONS
-      ALL_COLLECTIONS=$(docker exec "$CONTAINER_NAME" mongosh --quiet ${MONGOSH_AUTH[@]+"${MONGOSH_AUTH[@]}"} \
+      ALL_COLLECTIONS=$(docker exec "$CONTAINER_NAME" mongosh --quiet ${MONGOSH_AUTH[@]+"${MONGOSH_AUTH[@]}"} ${MONGOSH_TLS[@]+"${MONGOSH_TLS[@]}"} \
         --eval "db.getSiblingDB(${DB_JS}).getCollectionNames().forEach(function (n) { print(n); })")
 
       if [ "${#COLLECTIONS[@]}" -eq 1 ]; then
@@ -747,11 +798,13 @@ restore() {
     echo "Preflight: checking auth against destination database '${TARGET_DB}'..."
     local PREFLIGHT_AUTH=()
     build_mongosh_auth_args PREFLIGHT_AUTH
+    local PREFLIGHT_TLS=()
+    build_mongosh_tls_args PREFLIGHT_TLS
     # JSON-encode the DB name into a JS string literal so a name containing a
     # quote or backslash can't build malformed --eval JS (see verify / json_str).
     local TARGET_DB_JS
     TARGET_DB_JS=$(json_str "$TARGET_DB")
-    if docker exec "$CONTAINER_NAME" mongosh --quiet ${PREFLIGHT_AUTH[@]+"${PREFLIGHT_AUTH[@]}"} \
+    if docker exec "$CONTAINER_NAME" mongosh --quiet ${PREFLIGHT_AUTH[@]+"${PREFLIGHT_AUTH[@]}"} ${PREFLIGHT_TLS[@]+"${PREFLIGHT_TLS[@]}"} \
         --eval "quit((db.getSiblingDB(${TARGET_DB_JS}).runCommand({ listCollections: 1 }).ok === 1) ? 0 : 1)" >/dev/null 2>&1; then
       echo "Preflight auth check passed."
     else
@@ -772,6 +825,8 @@ restore() {
   # Build args safely (NO sh -c)
   local AUTH_ARGS=()
   build_mongo_auth_args AUTH_ARGS
+  local TLS_ARGS=()
+  build_mongo_tls_args TLS_ARGS
 
   local RESTORE_ARGS=(
     "--archive=/tmp/$(basename "$RESTORE_FILE")"
@@ -816,6 +871,7 @@ restore() {
 
   docker exec "$CONTAINER_NAME" mongorestore \
     ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} \
+    ${TLS_ARGS[@]+"${TLS_ARGS[@]}"} \
     "${RESTORE_ARGS[@]}"
 
   echo "MongoDB restore completed successfully."
@@ -852,6 +908,8 @@ verify() {
 
   local AUTH_ARGS=()
   build_mongosh_auth_args AUTH_ARGS
+  local TLS_ARGS=()
+  build_mongosh_tls_args TLS_ARGS
 
   # JSON-encode the four names into JS string literals so that names containing
   # quotes or backslashes can't break or alter the script (JSON strings are
@@ -938,7 +996,7 @@ const srcCol = ${SRC_COL_JS};
 const dstCol = ${DST_COL_JS};
 ${JS_BODY}"
 
-  if docker exec "$CONTAINER_NAME" mongosh --quiet ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} --eval "$JS"; then
+  if docker exec "$CONTAINER_NAME" mongosh --quiet ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} ${TLS_ARGS[@]+"${TLS_ARGS[@]}"} --eval "$JS"; then
     echo "Verification passed."
   else
     echo "Verification failed."
