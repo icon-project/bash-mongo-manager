@@ -102,9 +102,9 @@ USE_TLS="false"        # set to true when the mongod runs net.tls.mode=requireTL
 | `TELEGRAM_BOT_TOKEN`  | Telegram bot token from `@BotFather` (required, together with `TELEGRAM_CHAT_ID`, for Telegram alerts when `USE_ALERTS=true`). **Secret — never commit.**|
 | `TELEGRAM_CHAT_ID`    | Telegram chat/channel id to send the alert to (required together with `TELEGRAM_BOT_TOKEN`).|
 | `USE_TLS`             | When `true`, `mongodump`/`mongorestore`/`mongosh` connect over TLS. Defaults to `false`. Set this whenever the mongod runs `net.tls.mode=requireTLS` — a plaintext client is otherwise rejected mid-handshake (`socket was unexpectedly closed: EOF`). See "TLS connections" below.|
-| `MONGO_TLS_CA_FILE`   | Optional. Path **inside the container** to the CA `.pem` used to validate the server certificate (`--tlsCAFile`). Omit to use the container's system CA store.|
-| `MONGO_TLS_CERT_KEY_FILE` | Optional. Path **inside the container** to the client certificate+key `.pem` (`--tlsCertificateKeyFile`), only if the server requires client certificates.|
-| `MONGO_TLS_CERT_KEY_FILE_PASSWORD` | Optional. Password for `MONGO_TLS_CERT_KEY_FILE` (`--tlsCertificateKeyFilePassword`), only if that key is encrypted. Needed because the `docker exec` invocations are non-interactive and can't prompt for it. Ignored unless `MONGO_TLS_CERT_KEY_FILE` is also set.|
+| `MONGO_TLS_CA_FILE`   | Optional. Path **inside the container** to the CA `.pem` used to validate the server certificate (`--sslCAFile` for `mongodump`/`mongorestore`, `--tlsCAFile` for `mongosh`). Omit to use the container's system CA store.|
+| `MONGO_TLS_CERT_KEY_FILE` | Optional. Path **inside the container** to the client certificate+key `.pem` (`--sslPEMKeyFile` for `mongodump`/`mongorestore`, `--tlsCertificateKeyFile` for `mongosh`), only if the server requires client certificates.|
+| `MONGO_TLS_CERT_KEY_FILE_PASSWORD` | Optional. Password for `MONGO_TLS_CERT_KEY_FILE` (`--sslPEMKeyPassword` for `mongodump`/`mongorestore`, `--tlsCertificateKeyFilePassword` for `mongosh`), only if that key is encrypted. Needed because the `docker exec` invocations are non-interactive and can't prompt for it. Ignored unless `MONGO_TLS_CERT_KEY_FILE` is also set.|
 | `MONGO_TLS_ALLOW_INVALID` | When `true`, skip validation of the server's certificate chain **and** hostname. Defaults to `false`. The connection stays encrypted but unauthenticated. Usually required here because the tools connect to `localhost` inside the container (cert has no `localhost` SAN) or the cert is self-signed. `mongodump`/`mongorestore` get `--tlsInsecure`; `mongosh` gets `--tlsAllowInvalidCertificates --tlsAllowInvalidHostnames`. Prefer `MONGO_TLS_CA_FILE` when the CA is available in the container.|
 
 ### Dynamic container-name resolution
@@ -125,6 +125,8 @@ MONGO_TLS_ALLOW_INVALID="true"   # encrypted, validation skipped (localhost/self
 ```
 
 For a validated connection instead, provide `MONGO_TLS_CA_FILE` (and `MONGO_TLS_CERT_KEY_FILE` if the server requires client certs) and leave `MONGO_TLS_ALLOW_INVALID=false`. If the client key is password-encrypted, set `MONGO_TLS_CERT_KEY_FILE_PASSWORD` as well — the `docker exec` calls are non-interactive and cannot prompt for it.
+
+> **Note on flag names:** the MongoDB Database Tools (`mongodump`/`mongorestore`) use the legacy `--ssl*` option names (`--ssl`, `--sslCAFile`, `--sslPEMKeyFile`, `--sslPEMKeyPassword`) for the connection and client-cert options — they never adopted `mongosh`'s `--tls*` family. The one exception is the combined `--tlsInsecure`, which both accept. The script maps each `MONGO_TLS_*` variable to the right flag per tool, so you configure the env vars once and don't need to care.
 
 ---
 

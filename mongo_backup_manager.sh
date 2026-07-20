@@ -124,7 +124,8 @@ if [ -f "$ENV_FILE" ]; then
   # survive un-exporting. So drop the export attribute while keeping the values
   # in-process. (export -n on an unset name is a harmless no-op; keep this list in
   # sync with the secret-bearing vars — MONGO_TLS_CERT_KEY_FILE_PASSWORD is likewise
-  # passed to the tools as a --tlsCertificateKeyFilePassword flag via build_mongo*_tls_args.)
+  # passed to the tools as a command-line flag via build_mongo*_tls_args (--sslPEMKeyPassword
+  # for mongodump/mongorestore, --tlsCertificateKeyFilePassword for mongosh).)
   export -n MONGO_PASSWORD MONGO_TLS_CERT_KEY_FILE_PASSWORD DISCORD_WEBHOOK_URL TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID 2>/dev/null || true
 else
   echo "Error: The .env file is missing. Please create the .env file with the required environment variables."
@@ -300,20 +301,24 @@ build_mongosh_auth_args() {
 
 # Helper: build mongodump/mongorestore TLS args as an array (--flag=val form, like
 # build_mongo_auth_args). Empty unless USE_TLS is enabled. CA/cert paths are paths
-# *inside the container* (the tools run via docker exec). mongodump/mongorestore
-# take the combined --tlsInsecure to bypass cert-chain + hostname validation.
+# *inside the container* (the tools run via docker exec). NOTE: the MongoDB Database
+# Tools (mongodump/mongorestore) use the legacy --ssl* option names for the connection
+# and client-cert flags — NOT mongosh's --tls* family (build_mongosh_tls_args). The one
+# --tls* option they expose is the combined --tlsInsecure, which bypasses cert-chain +
+# hostname validation. (Verified against mongodump 100.11.0: --ssl / --sslCAFile /
+# --sslPEMKeyFile / --sslPEMKeyPassword + --tlsInsecure.)
 build_mongo_tls_args() {
   # shellcheck disable=SC2178  # _out is a nameref to an array; the string assignment is the ref target, not a value
   local -n _out=$1
   _out=()
   if [ "$USE_TLS" != "false" ]; then
-    _out+=( "--tls" )
-    if [ -n "${MONGO_TLS_CA_FILE:-}" ]; then _out+=( "--tlsCAFile=$MONGO_TLS_CA_FILE" ); fi
+    _out+=( "--ssl" )
+    if [ -n "${MONGO_TLS_CA_FILE:-}" ]; then _out+=( "--sslCAFile=$MONGO_TLS_CA_FILE" ); fi
     if [ -n "${MONGO_TLS_CERT_KEY_FILE:-}" ]; then
-      _out+=( "--tlsCertificateKeyFile=$MONGO_TLS_CERT_KEY_FILE" )
+      _out+=( "--sslPEMKeyFile=$MONGO_TLS_CERT_KEY_FILE" )
       # Unlock a password-encrypted client key non-interactively (docker exec has no
       # tty to prompt on). Only meaningful alongside the cert-key file, so nested here.
-      if [ -n "${MONGO_TLS_CERT_KEY_FILE_PASSWORD:-}" ]; then _out+=( "--tlsCertificateKeyFilePassword=$MONGO_TLS_CERT_KEY_FILE_PASSWORD" ); fi
+      if [ -n "${MONGO_TLS_CERT_KEY_FILE_PASSWORD:-}" ]; then _out+=( "--sslPEMKeyPassword=$MONGO_TLS_CERT_KEY_FILE_PASSWORD" ); fi
     fi
     if [ "$MONGO_TLS_ALLOW_INVALID" != "false" ]; then _out+=( "--tlsInsecure" ); fi
   fi
