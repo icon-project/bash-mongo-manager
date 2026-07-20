@@ -104,6 +104,7 @@ USE_TLS="false"        # set to true when the mongod runs net.tls.mode=requireTL
 | `USE_TLS`             | When `true`, `mongodump`/`mongorestore`/`mongosh` connect over TLS. Defaults to `false`. Set this whenever the mongod runs `net.tls.mode=requireTLS` — a plaintext client is otherwise rejected mid-handshake (`socket was unexpectedly closed: EOF`). See "TLS connections" below.|
 | `MONGO_TLS_CA_FILE`   | Optional. Path **inside the container** to the CA `.pem` used to validate the server certificate (`--tlsCAFile`). Omit to use the container's system CA store.|
 | `MONGO_TLS_CERT_KEY_FILE` | Optional. Path **inside the container** to the client certificate+key `.pem` (`--tlsCertificateKeyFile`), only if the server requires client certificates.|
+| `MONGO_TLS_CERT_KEY_FILE_PASSWORD` | Optional. Password for `MONGO_TLS_CERT_KEY_FILE` (`--tlsCertificateKeyFilePassword`), only if that key is encrypted. Needed because the `docker exec` invocations are non-interactive and can't prompt for it. Ignored unless `MONGO_TLS_CERT_KEY_FILE` is also set.|
 | `MONGO_TLS_ALLOW_INVALID` | When `true`, skip validation of the server's certificate chain **and** hostname. Defaults to `false`. The connection stays encrypted but unauthenticated. Usually required here because the tools connect to `localhost` inside the container (cert has no `localhost` SAN) or the cert is self-signed. `mongodump`/`mongorestore` get `--tlsInsecure`; `mongosh` gets `--tlsAllowInvalidCertificates --tlsAllowInvalidHostnames`. Prefer `MONGO_TLS_CA_FILE` when the CA is available in the container.|
 
 ### Dynamic container-name resolution
@@ -123,7 +124,7 @@ USE_TLS="true"
 MONGO_TLS_ALLOW_INVALID="true"   # encrypted, validation skipped (localhost/self-signed)
 ```
 
-For a validated connection instead, provide `MONGO_TLS_CA_FILE` (and `MONGO_TLS_CERT_KEY_FILE` if the server requires client certs) and leave `MONGO_TLS_ALLOW_INVALID=false`.
+For a validated connection instead, provide `MONGO_TLS_CA_FILE` (and `MONGO_TLS_CERT_KEY_FILE` if the server requires client certs) and leave `MONGO_TLS_ALLOW_INVALID=false`. If the client key is password-encrypted, set `MONGO_TLS_CERT_KEY_FILE_PASSWORD` as well — the `docker exec` calls are non-interactive and cannot prompt for it.
 
 ---
 

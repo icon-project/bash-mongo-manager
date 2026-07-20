@@ -308,7 +308,12 @@ build_mongo_tls_args() {
   if [ "$USE_TLS" != "false" ]; then
     _out+=( "--tls" )
     if [ -n "${MONGO_TLS_CA_FILE:-}" ]; then _out+=( "--tlsCAFile=$MONGO_TLS_CA_FILE" ); fi
-    if [ -n "${MONGO_TLS_CERT_KEY_FILE:-}" ]; then _out+=( "--tlsCertificateKeyFile=$MONGO_TLS_CERT_KEY_FILE" ); fi
+    if [ -n "${MONGO_TLS_CERT_KEY_FILE:-}" ]; then
+      _out+=( "--tlsCertificateKeyFile=$MONGO_TLS_CERT_KEY_FILE" )
+      # Unlock a password-encrypted client key non-interactively (docker exec has no
+      # tty to prompt on). Only meaningful alongside the cert-key file, so nested here.
+      if [ -n "${MONGO_TLS_CERT_KEY_FILE_PASSWORD:-}" ]; then _out+=( "--tlsCertificateKeyFilePassword=$MONGO_TLS_CERT_KEY_FILE_PASSWORD" ); fi
+    fi
     if [ "$MONGO_TLS_ALLOW_INVALID" != "false" ]; then _out+=( "--tlsInsecure" ); fi
   fi
 }
@@ -323,7 +328,12 @@ build_mongosh_tls_args() {
   if [ "$USE_TLS" != "false" ]; then
     _out+=( "--tls" )
     if [ -n "${MONGO_TLS_CA_FILE:-}" ]; then _out+=( "--tlsCAFile" "$MONGO_TLS_CA_FILE" ); fi
-    if [ -n "${MONGO_TLS_CERT_KEY_FILE:-}" ]; then _out+=( "--tlsCertificateKeyFile" "$MONGO_TLS_CERT_KEY_FILE" ); fi
+    if [ -n "${MONGO_TLS_CERT_KEY_FILE:-}" ]; then
+      _out+=( "--tlsCertificateKeyFile" "$MONGO_TLS_CERT_KEY_FILE" )
+      # Unlock a password-encrypted client key non-interactively (docker exec has no
+      # tty to prompt on). Only meaningful alongside the cert-key file, so nested here.
+      if [ -n "${MONGO_TLS_CERT_KEY_FILE_PASSWORD:-}" ]; then _out+=( "--tlsCertificateKeyFilePassword" "$MONGO_TLS_CERT_KEY_FILE_PASSWORD" ); fi
+    fi
     if [ "$MONGO_TLS_ALLOW_INVALID" != "false" ]; then
       _out+=( "--tlsAllowInvalidCertificates" "--tlsAllowInvalidHostnames" )
     fi
